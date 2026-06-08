@@ -81,8 +81,8 @@ Buttons in the toolbar: **Start**, **Restart**, **Stop**, **Kill**, and **Save W
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/ratty.git
-cd ratty
+git clone https://github.com/Stealthee/Shenanigan-Joes-Pterodactyl-Server-Manager.git
+cd Shenanigan-Joes-Pterodactyl-Server-Manager
 python -m venv .venv
 source .venv/bin/activate      # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
@@ -93,7 +93,7 @@ pip install -r requirements.txt
 ```bash
 tee ~/.local/bin/sjpsm > /dev/null << 'EOF'
 #!/usr/bin/env bash
-cd /path/to/ratty || exit 1
+cd /path/to/Shenanigan-Joes-Pterodactyl-Server-Manager || exit 1
 nohup .venv/bin/python -m ratty "$@" >/dev/null 2>&1 &
 disown
 EOF
