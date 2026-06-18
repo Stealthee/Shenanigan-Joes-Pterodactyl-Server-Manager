@@ -80,13 +80,35 @@ Buttons in the toolbar: **Start**, **Restart**, **Stop**, **Kill**, and **Save W
 
 ## Installation
 
+### Linux / macOS
+
 ```bash
 git clone https://github.com/Stealthee/Shenanigan-Joes-Pterodactyl-Server-Manager.git
 cd Shenanigan-Joes-Pterodactyl-Server-Manager
 python -m venv .venv
-source .venv/bin/activate      # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+### Windows 11
+
+Install [Python 3.11+](https://www.python.org/downloads/) first, making sure **"Add python.exe to PATH"** is checked during setup. Then, in PowerShell or Command Prompt:
+
+```bat
+git clone https://github.com/Stealthee/Shenanigan-Joes-Pterodactyl-Server-Manager.git
+cd Shenanigan-Joes-Pterodactyl-Server-Manager
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+Run it with:
+
+```bat
+.venv\Scripts\python.exe -m ratty
+```
+
+(See the launcher below for a way to run it without a console window or a `cd` every time.)
 
 ### Create the launcher (Linux)
 
