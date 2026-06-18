@@ -1,4 +1,3 @@
-import fcntl
 import sys
 import tempfile
 from pathlib import Path
@@ -16,11 +15,26 @@ _lock_fh = None
 
 
 def _acquire_singleton_lock() -> bool:
+    """Cross-platform single-instance guard via an exclusive lock on a temp file.
+
+    fcntl (POSIX) and msvcrt (Windows) lock files in incompatible ways, so only
+    the locking call itself branches on platform.
+    """
     global _lock_fh
     lock_path = Path(tempfile.gettempdir()) / "sjpsm.lock"
-    fh = open(lock_path, "w")
+    fh = open(lock_path, "w+")
     try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if sys.platform == "win32":
+            import msvcrt
+
+            fh.write("locked")
+            fh.flush()
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         _lock_fh = fh  # keep reference alive — releasing it drops the lock
         return True
     except OSError:

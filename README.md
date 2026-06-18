@@ -102,6 +102,18 @@ chmod +x ~/.local/bin/sjpsm
 
 Then just type `sjpsm` from any terminal. It launches detached so it won't lock up your terminal window.
 
+### Create the launcher (Windows 11)
+
+Create `sjpsm.bat` somewhere on your `PATH` (or just on the Desktop):
+
+```bat
+@echo off
+cd /d "C:\path\to\Shenanigan-Joes-Pterodactyl-Server-Manager"
+start "" /B .venv\Scripts\pythonw.exe -m ratty %*
+```
+
+Using `pythonw.exe` (instead of `python.exe`) launches without opening a console window. Double-click the `.bat` file, or run `sjpsm` from a terminal once its folder is on `PATH`.
+
 ---
 
 ## Connecting to a Server
