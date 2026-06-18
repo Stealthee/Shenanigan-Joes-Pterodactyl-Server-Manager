@@ -10,7 +10,7 @@ Three independent channels are configured here:
 Defaults reflect what each service ships with; every value is editable.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 DEFAULT_TELNET_PORT = 8081
 DEFAULT_PTERODACTYL_PORT = 443
@@ -40,6 +40,14 @@ class ServerConfig:
     autoban_level_threshold: int = 5    # levels per minute
     autoban_speed_enabled: bool = False
     autoban_speed_threshold: int = 50   # metres per second
+
+    # Roster of every player ever seen on this server, so the Players tab can
+    # show people as "Offline" instead of forgetting them on disconnect.
+    # Each entry: {"steamid": str, "name": str, "last_seen": str}
+    known_players: list[dict] = field(default_factory=list)
+
+    mods_dir: str = "/Mods"
+    locked_mods: list[str] = field(default_factory=list)
 
     @property
     def pterodactyl_base_url(self) -> str:

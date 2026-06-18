@@ -24,7 +24,8 @@ _PLAYER_RE = re.compile(
     r"(?P<name>.+?),\s*"
     r"pos=\((?P<x>-?[\d.]+),\s*(?P<y>-?[\d.]+),\s*(?P<z>-?[\d.]+)\).*?"
     r"level=(?P<level>\d+).*?"
-    r"steamid=(?P<steamid>\w+).*?"
+    r"pltfmid=(?:Steam_)?(?P<steamid>\d+).*?"
+    r"ip=(?P<ip>[\d.]+).*?"
     r"ping=(?P<ping>\d+)",
     re.IGNORECASE,
 )
@@ -44,6 +45,7 @@ class Player:
     z: float
     level: int
     steamid: str
+    ip: str
     ping: int
 
 
@@ -185,16 +187,21 @@ class TelnetClient:
                     z=float(match["z"]),
                     level=int(match["level"]),
                     steamid=match["steamid"],
+                    ip=match["ip"],
                     ping=int(match["ping"]),
                 )
             )
         return players
 
     def teleport_to_coords(self, player: str, x: float, y: float, z: float) -> list[str]:
-        return self.run_command(f"tp \"{player}\" {x:.1f} {y:.1f} {z:.1f}")
+        return self.run_command(f"teleportplayer \"{player}\" {x:.1f} {y:.1f} {z:.1f}")
 
     def teleport_to_player(self, player: str, target: str) -> list[str]:
-        return self.run_command(f"tp \"{player}\" \"{target}\"")
+        return self.run_command(f"teleportplayer \"{player}\" \"{target}\"")
+
+    def spawn_entity(self, entity_id: int, entity_name: str, count: int = 1) -> list[str]:
+        """Spawn `count` of `entity_name` near the entity/player with id `entity_id`."""
+        return self.run_command(f"spawnentity {entity_id} {entity_name} {count}")
 
     def ban_add(self, identifier: str, duration: int = 0, unit: str = "forever", reason: str = "") -> list[str]:
         if unit == "forever":
@@ -221,6 +228,20 @@ class TelnetClient:
                 entries.append(BanEntry(identifier=stripped, expires="", raw=stripped))
         return entries
 
+    def admin_add(self, identifier: str, level: int = 0, display_name: str = "") -> list[str]:
+        """Grant a permission level (0 = full admin) to a player.
+
+        `identifier` may be an online player's name/entity id, or "Steam_<steamid>"
+        for an offline player.
+        """
+        cmd = f"admin add \"{identifier}\" {level}"
+        if display_name:
+            cmd += f" \"{display_name}\""
+        return self.run_command(cmd)
+
+    def admin_remove(self, identifier: str) -> list[str]:
+        return self.run_command(f"admin remove \"{identifier}\"")
+
     def kick(self, player: str, reason: str = "") -> list[str]:
         cmd = f"kick \"{player}\""
         if reason:
@@ -229,3 +250,12 @@ class TelnetClient:
 
     def say(self, message: str) -> list[str]:
         return self.run_command(f"say \"{message}\"")
+
+    _GAME_TIME_RE = re.compile(r"(Day\s+\d+.*)", re.IGNORECASE)
+
+    def get_game_time(self) -> str:
+        for line in self.run_command("gettime"):
+            match = self._GAME_TIME_RE.search(line)
+            if match:
+                return match.group(1).strip()
+        return ""

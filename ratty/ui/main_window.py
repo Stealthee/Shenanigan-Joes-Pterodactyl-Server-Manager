@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import os
 import re
 import threading
 from collections.abc import Callable
+from datetime import datetime
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QSettings, Qt, QTimer, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QInputDialog,
@@ -61,6 +65,68 @@ _STARTUP_OVERRIDES: frozenset[str] = frozenset({
 #   Chat (from 'Steam_765xxxxx', entity id '171', to 'Global'): 'PlayerName': hello
 _CHAT_LINE_RE = re.compile(r"Chat \([^)]*\):\s*(?P<text>.*)$")
 
+# Quick-pick entries for the player "Spawn" submenu, passed straight to the
+# `spawnentity` console command. Pulled from this server's own entity class list
+# (`spawnentityat` with no args, run against V 3.0.0 b252) -- names are version-
+# specific and drift between game updates, so re-check that list if these start
+# coming back "Entity 'x' not found".
+_ZOMBIE_TYPES: tuple[tuple[str, str], ...] = (
+    ("Walker", "zombieArlene"),
+    ("Marlene", "zombieMarlene"),
+    ("Party Girl", "zombiePartyGirl"),
+    ("Nurse", "zombieNurse"),
+    ("Joe", "zombieJoe"),
+    ("Steve", "zombieSteve"),
+    ("Tom Clark", "zombieTomClark"),
+    ("Business Man", "zombieBusinessMan"),
+    ("Burnt", "zombieBurnt"),
+    ("Rancher", "zombieRancher"),
+    ("Chuck", "zombieChuck"),
+    ("Spider", "zombieSpider"),
+    ("Boe", "zombieBoe"),
+    ("Hazmat", "zombieMaleHazmat"),
+    ("Janitor", "zombieJanitor"),
+    ("Inmate", "zombieInmate"),
+    ("Moe", "zombieMoe"),
+    ("Lab Worker", "zombieLab"),
+    ("Darlene", "zombieDarlene"),
+    ("Yo Mama", "zombieYo"),
+    ("Utility Worker", "zombieUtilityWorker"),
+    ("Biker", "zombieBiker"),
+    ("Lumberjack", "zombieLumberjack"),
+    ("Fat Female", "zombieFemaleFat"),
+    ("Fat Hawaiian (exploder)", "zombieFatHawaiian"),
+    ("Bowler", "zombieBowler"),
+    ("Fat Cop (acid)", "zombieFatCop"),
+    ("Skateboarder", "zombieSkateboarder"),
+    ("Soldier", "zombieSoldier"),
+    ("Screamer (calls a horde!)", "zombieScreamer"),
+    ("Mutated", "zombieMutated"),
+    ("Demolition (explosive)", "zombieDemolition"),
+    ("Crawler", "zombieSteveCrawler"),
+    ("Feral Wight", "zombieWightFeral"),
+    ("Radiated Wight", "zombieWightRadiated"),
+)
+
+_ANIMAL_TYPES: tuple[tuple[str, str], ...] = (
+    ("Rabbit", "animalRabbit"),
+    ("Chicken", "animalChicken"),
+    ("Angry Chicken", "animalChickenHostile"),
+    ("Stag", "animalStag"),
+    ("Doe", "animalDoe"),
+    ("Boar", "animalBoar"),
+    ("Coyote", "animalCoyote"),
+    ("Wolf", "animalWolf"),
+    ("Dire Wolf", "animalDireWolf"),
+    ("Bear", "animalBear"),
+    ("Mountain Lion", "animalMountainLion"),
+    ("Snake", "animalSnake"),
+    ("Zombie Dog", "animalZombieDog"),
+    ("Zombie Bear", "animalZombieBear"),
+    ("Zombie Boar", "animalZombieBoar"),
+    ("Zombie Vulture", "animalZombieVulture"),
+)
+
 
 class _Bridge(QObject):
     """Marshals results from background threads back onto the UI thread."""
@@ -87,6 +153,25 @@ class TeleportToCoordsDialog(QDialog):
 
     def coords(self) -> tuple[float, float, float]:
         return self.x.value(), self.y.value(), self.z.value()
+
+
+class SpawnEntityDialog(QDialog):
+    def __init__(self, player_name: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Spawn entity at {player_name}")
+        form = QFormLayout(self)
+        self.name = QLineEdit()
+        self.name.setPlaceholderText("e.g. zombieArlene, wolf, bear")
+        self.count = QSpinBox(); self.count.setRange(1, 20); self.count.setValue(1)
+        form.addRow("Entity class name", self.name)
+        form.addRow("Count", self.count)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form.addRow(buttons)
+
+    def values(self) -> tuple[str, int]:
+        return self.name.text().strip(), self.count.value()
 
 
 class BanDialog(QDialog):
@@ -122,12 +207,23 @@ class MainWindow(QMainWindow):
         self._save_config_callback = save_config_callback
         self.setWindowTitle(f"Shenanigan Joe's Pterodactyl Server Manager -- {config.name}")
         self.resize(1000, 650)
+        self._restore_window_geometry()
 
         self._telnet: TelnetClient | None = None
         self._ptero: PterodactylClient | None = None
         self._console: ConsoleStream | None = None
         self._sftp: SftpClient | None = None
         self._players: list[Player] = []
+
+        # Every player ever seen on this server, keyed by steamid, so the
+        # Players tab can keep showing people (as "Offline") after they leave.
+        self._known_players: dict[str, dict] = {
+            p["steamid"]: dict(p) for p in config.known_players if p.get("steamid")
+        }
+
+        # steamid -> (x, y, z) position immediately before our last teleport,
+        # so a right-click "Return" can put the player back.
+        self._teleport_history: dict[str, tuple[float, float, float]] = {}
 
         # steamid -> (first_seen_level, first_seen_timestamp)
         self._level_history: dict[str, tuple[int, float]] = {}
@@ -139,6 +235,8 @@ class MainWindow(QMainWindow):
         self._sftp_open_path: str | None = None
         self._sftp_dirty = False
         self._sftp_loading = False
+
+        self._mods_entries: list[str] = []
 
         self._settings_xml: str | None = None
         self._settings_properties: list[XmlProperty] = []
@@ -152,6 +250,7 @@ class MainWindow(QMainWindow):
         self._sftp_status_dot: QLabel | None = None
         self._sftp_reconnect_timer: QTimer | None = None
         self._sftp_health_timer: QTimer | None = None
+        self._game_time_label: QLabel | None = None
 
         self._bridge = _Bridge()
         self._bridge.result.connect(self._on_async_result)
@@ -163,6 +262,17 @@ class MainWindow(QMainWindow):
         self._player_refresh_timer = QTimer(self)
         self._player_refresh_timer.timeout.connect(self.refresh_players)
         self._player_refresh_timer.start(self.PLAYER_REFRESH_INTERVAL_MS)
+
+    # -- window geometry ----------------------------------------------------------
+
+    def _restore_window_geometry(self) -> None:
+        geometry = QSettings("ratty", "sjpsm").value("main_window/geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+
+    def closeEvent(self, event) -> None:
+        QSettings("ratty", "sjpsm").setValue("main_window/geometry", self.saveGeometry())
+        super().closeEvent(event)
 
     # -- UI construction --------------------------------------------------------
 
@@ -193,6 +303,12 @@ class MainWindow(QMainWindow):
         if self.config.sftp_host:
             self._sftp_status_dot = self._add_status_indicator(bar, "SFTP")
             self._set_sftp_status(False)
+
+        if self.config.telnet_host:
+            self._game_time_label = QLabel("")
+            self._game_time_label.setStyleSheet("color: white; font-weight: bold; margin-left: 6px;")
+            self._game_time_label.setToolTip("Current in-game day and time")
+            bar.addWidget(self._game_time_label)
 
         bar.addStretch(1)
 
@@ -264,6 +380,8 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_ban_panel(), "Banned")
         tabs.addTab(self._build_files_panel(), "Files")
         tabs.addTab(self._build_settings_panel(), "Server Settings")
+        self._mods_panel = self._build_mods_panel()
+        tabs.addTab(self._mods_panel, "Mods")
         self._left_tabs = tabs
         return tabs
 
@@ -310,8 +428,8 @@ class MainWindow(QMainWindow):
                        self.autoban_speed_enabled, self.autoban_speed_threshold):
             widget.currentIndexChanged.connect(self._save_autoban_settings) if hasattr(widget, 'currentIndexChanged') else widget.valueChanged.connect(self._save_autoban_settings)
 
-        self.player_table = QTableWidget(0, 5)
-        self.player_table.setHorizontalHeaderLabels(["Name", "Level", "SteamID", "Position", "Ping"])
+        self.player_table = QTableWidget(0, 7)
+        self.player_table.setHorizontalHeaderLabels(["Name", "Status", "Level", "SteamID", "Position", "Ping", "Last Seen"])
         self.player_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.player_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.player_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -319,15 +437,27 @@ class MainWindow(QMainWindow):
         header = self.player_table.horizontalHeader()
         from PySide6.QtWidgets import QHeaderView
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)          # Name fills spare space
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)             # Level
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)             # SteamID
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)             # Position
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)             # Ping
-        header.resizeSection(1, 55)
-        header.resizeSection(2, 160)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)             # Status
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)             # Level
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)             # SteamID
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)             # Position
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)             # Ping
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)             # Last Seen
+        header.resizeSection(1, 60)
+        header.resizeSection(2, 55)
         header.resizeSection(3, 160)
-        header.resizeSection(4, 55)
+        header.resizeSection(4, 160)
+        header.resizeSection(5, 55)
+        header.resizeSection(6, 120)
         layout.addWidget(self.player_table)
+
+        history_row = QHBoxLayout()
+        history_row.addStretch(1)
+        clear_history_btn = QPushButton("Clear Player History")
+        clear_history_btn.setToolTip("Remove everyone from the offline player list -- use after a server wipe.")
+        clear_history_btn.clicked.connect(self._clear_player_history)
+        history_row.addWidget(clear_history_btn)
+        layout.addLayout(history_row)
         return wrapper
 
     def _build_ban_panel(self) -> QWidget:
@@ -372,12 +502,20 @@ class MainWindow(QMainWindow):
         nav_row = QHBoxLayout()
         up_btn = QPushButton("Up")
         up_btn.clicked.connect(self._sftp_go_up)
-        self.sftp_path_label = QLabel(self._sftp_cwd)
-        self.sftp_path_label.setStyleSheet("font-family: monospace;")
+        self.sftp_path_edit = QLineEdit(self._sftp_cwd)
+        self.sftp_path_edit.setStyleSheet("font-family: monospace;")
+        self.sftp_path_edit.setPlaceholderText("/path/to/folder")
+        self.sftp_path_edit.returnPressed.connect(self._sftp_navigate_to_typed_path)
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(lambda: self._sftp_browse(self._sftp_cwd))
+        upload_files_btn = QPushButton("Upload Files...")
+        upload_files_btn.clicked.connect(self._upload_sftp_files)
+        upload_folder_btn = QPushButton("Upload Folder...")
+        upload_folder_btn.clicked.connect(self._upload_sftp_folder)
         nav_row.addWidget(up_btn)
-        nav_row.addWidget(self.sftp_path_label, 1)
+        nav_row.addWidget(self.sftp_path_edit, 1)
+        nav_row.addWidget(upload_files_btn)
+        nav_row.addWidget(upload_folder_btn)
         nav_row.addWidget(refresh_btn)
         layout.addLayout(nav_row)
 
@@ -449,6 +587,38 @@ class MainWindow(QMainWindow):
         self.settings_save_btn.clicked.connect(self._save_server_settings)
         bottom_row.addWidget(self.settings_save_btn)
         layout.addLayout(bottom_row)
+
+        return wrapper
+
+    def _build_mods_panel(self) -> QWidget:
+        wrapper = QWidget()
+        layout = QVBoxLayout(wrapper)
+
+        if not self.config.sftp_host:
+            note = QLabel("Managing mods requires SFTP (not configured for this server).")
+            note.setWordWrap(True)
+            note.setStyleSheet("color: palette(placeholder-text);")
+            layout.addWidget(note)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel(f"Folder: <tt>{self.config.mods_dir}</tt>"))
+        top_row.addStretch(1)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self._mods_refresh)
+        top_row.addWidget(refresh_btn)
+        layout.addLayout(top_row)
+
+        self.mods_list = QListWidget()
+        self.mods_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.mods_list.customContextMenuRequested.connect(self._show_mods_menu)
+        layout.addWidget(self.mods_list, 1)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("Add Mod Folder...")
+        add_btn.clicked.connect(self._mods_add)
+        btn_row.addWidget(add_btn)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
 
         return wrapper
 
@@ -656,15 +826,28 @@ class MainWindow(QMainWindow):
             self._start_console_stream()
         elif tag == "list_players":
             self._players = value  # type: ignore[assignment]
+            self._update_known_players()
             self._populate_player_table()
         elif tag == "ban_list":
             self._populate_ban_table(value)  # type: ignore[arg-type]
-        elif tag in ("teleport", "kick", "ban_add", "ban_remove", "console_command", "chat_message"):
+        elif tag == "teleport":
+            reply = " / ".join(line.strip() for line in value if line.strip())  # type: ignore[union-attr]
+            self.statusBar().showMessage(reply or "Teleport command sent", 6000)
+        elif tag == "spawn_entity":
+            reply = " / ".join(line.strip() for line in value if line.strip())  # type: ignore[union-attr]
+            self.statusBar().showMessage(reply or "Spawn command sent", 6000)
+        elif tag in ("admin_add", "admin_remove"):
+            reply = " / ".join(line.strip() for line in value if line.strip())  # type: ignore[union-attr]
+            self.statusBar().showMessage(reply or f"{tag} OK", 6000)
+        elif tag in ("kick", "ban_add", "ban_remove", "console_command", "chat_message"):
             self.statusBar().showMessage(f"{tag} OK", 4000)
             if tag in ("ban_add", "ban_remove"):
                 self.refresh_bans()
             if tag == "kick":
                 self.refresh_players()
+        elif tag == "game_time":
+            if self._game_time_label is not None and value:
+                self._game_time_label.setText(str(value))
         elif tag == "save_world":
             self.statusBar().showMessage("World saved -- safe to restart", 6000)
         elif tag == "power_action":
@@ -683,12 +866,14 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("SFTP connected", 5000)
             self._sftp_browse("/")
             self._load_server_settings()
+            self._mods_refresh()
         elif tag == "sftp_reconnect":
             self._sftp = value  # type: ignore[assignment]
             self._set_sftp_status(True)
             self._start_sftp_health_check()
             self.statusBar().showMessage("SFTP reconnected", 5000)
             self._sftp_browse(self._sftp_cwd)
+            self._mods_refresh()
         elif tag == "sftp_list":
             path, entries = value  # type: ignore[misc]
             self._sftp_cwd = path
@@ -721,6 +906,24 @@ class MainWindow(QMainWindow):
                 self._sftp_open_path = new_path
                 self._set_sftp_dirty(self._sftp_dirty)
             self._sftp_browse(self._sftp_cwd)
+        elif tag == "sftp_chmod":
+            self.statusBar().showMessage(f"Updated permissions for {value}", 4000)
+            self._sftp_browse(self._sftp_cwd)
+        elif tag == "sftp_upload":
+            refresh_dir, count = value  # type: ignore[misc]
+            self.statusBar().showMessage(f"Uploaded {count} file(s)", 5000)
+            if refresh_dir == self._sftp_cwd:
+                self._sftp_browse(self._sftp_cwd)
+        elif tag == "reset_stats":
+            player_name, deleted = value  # type: ignore[misc]
+            if deleted:
+                self.statusBar().showMessage(
+                    f"Reset {player_name}: deleted {len(deleted)} file(s)", 6000
+                )
+            else:
+                self.statusBar().showMessage(
+                    f"No save files found for {player_name} — nothing deleted", 8000
+                )
         elif tag == "settings_load":
             xml_text = str(value)
             self._settings_xml = xml_text
@@ -737,6 +940,18 @@ class MainWindow(QMainWindow):
                 "Settings saved",
                 "serverconfig.xml has been updated.\n\nThe server needs to be restarted for these changes to take effect.",
             )
+        elif tag == "mods_list":
+            self._mods_entries = value  # type: ignore[assignment]
+            self._populate_mods_list()
+        elif tag == "mods_upload":
+            mod_name, count = value  # type: ignore[misc]
+            self.statusBar().showMessage(
+                f"Installed mod '{mod_name}' ({count} file(s) uploaded, permissions set to 755)", 6000
+            )
+            self._mods_refresh()
+        elif tag == "mods_delete":
+            self.statusBar().showMessage(f"Removed mod '{value}'", 5000)
+            self._mods_refresh()
 
     def _on_async_error(self, tag: str, message: str) -> None:
         self.statusBar().showMessage(f"{tag} failed: {message}", 8000)
@@ -760,29 +975,77 @@ class MainWindow(QMainWindow):
             self.settings_hint.setText(f"Failed to load {SERVER_CONFIG_PATH}: {message}")
         elif tag == "settings_save":
             self.settings_hint.setText(f"Failed to save {SERVER_CONFIG_PATH}: {message}")
+        elif tag == "sftp_upload":
+            QMessageBox.warning(self, "Upload error", f"Upload failed:\n{message}")
+        elif tag == "sftp_chmod":
+            QMessageBox.warning(self, "Permissions error", f"Could not change permissions:\n{message}")
+        elif tag == "reset_stats":
+            QMessageBox.warning(self, "Reset failed", f"Could not reset player stats:\n{message}")
+        elif tag == "mods_list":
+            self.statusBar().showMessage(f"Mods folder not found or inaccessible: {message}", 8000)
+        elif tag == "mods_upload":
+            QMessageBox.warning(self, "Upload failed", f"Could not install mod:\n{message}")
+        elif tag == "mods_delete":
+            QMessageBox.warning(self, "Remove failed", f"Could not remove mod:\n{message}")
 
     # -- players ------------------------------------------------------------------
 
-    PLAYER_REFRESH_INTERVAL_MS = 15_000
+    PLAYER_REFRESH_INTERVAL_MS = 60_000
 
     def refresh_players(self) -> None:
         if not self._telnet:
             return
         self._run_async("list_players", self._telnet.list_players)
+        self._run_async("game_time", self._telnet.get_game_time)
 
     def _populate_player_table(self) -> None:
         table = self.player_table
-        table.setRowCount(len(self._players))
-        for row, player in enumerate(self._players):
-            table.setItem(row, 0, QTableWidgetItem(player.name))
+        online_steamids = {p.steamid for p in self._players}
+        offline = sorted(
+            [info for sid, info in self._known_players.items() if sid not in online_steamids],
+            key=lambda i: i.get("last_seen", ""),
+            reverse=True,
+        )
+        table.setRowCount(len(self._players) + len(offline))
+        row = 0
+        for player in self._players:
+            name_item = QTableWidgetItem(player.name)
+            name_item.setData(Qt.ItemDataRole.UserRole, player.steamid)
+            table.setItem(row, 0, name_item)
+            status_item = QTableWidgetItem("Online")
+            status_item.setForeground(QColor("#2ecc71"))
+            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            table.setItem(row, 1, status_item)
             lvl_item = QTableWidgetItem(str(player.level))
             lvl_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            table.setItem(row, 1, lvl_item)
-            table.setItem(row, 2, QTableWidgetItem(player.steamid))
-            table.setItem(row, 3, QTableWidgetItem(f"{player.x:.0f}, {player.y:.0f}, {player.z:.0f}"))
+            table.setItem(row, 2, lvl_item)
+            table.setItem(row, 3, QTableWidgetItem(player.steamid))
+            table.setItem(row, 4, QTableWidgetItem(f"{player.x:.0f}, {player.y:.0f}, {player.z:.0f}"))
             ping_item = QTableWidgetItem(str(player.ping))
             ping_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            table.setItem(row, 4, ping_item)
+            table.setItem(row, 5, ping_item)
+            table.setItem(row, 6, QTableWidgetItem(""))
+            row += 1
+        for info in offline:
+            fg = QColor("#888888")
+
+            def _gray(text: str, center: bool = False) -> QTableWidgetItem:
+                it = QTableWidgetItem(text)
+                it.setForeground(fg)
+                if center:
+                    it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                return it
+
+            name_item = _gray(info.get("name", ""))
+            name_item.setData(Qt.ItemDataRole.UserRole, info.get("steamid", ""))
+            table.setItem(row, 0, name_item)
+            table.setItem(row, 1, _gray("Offline", center=True))
+            table.setItem(row, 2, _gray(str(info.get("level", "-")), center=True))
+            table.setItem(row, 3, _gray(info.get("steamid", "")))
+            table.setItem(row, 4, _gray("-"))
+            table.setItem(row, 5, _gray("-", center=True))
+            table.setItem(row, 6, _gray(info.get("last_seen", "")))
+            row += 1
         self._check_level_cheaters()
 
     def _check_level_cheaters(self) -> None:
@@ -847,35 +1110,101 @@ class MainWindow(QMainWindow):
 
     def _show_player_menu(self, pos) -> None:
         row = self.player_table.rowAt(pos.y())
-        if row < 0 or row >= len(self._players):
+        item = self.player_table.item(row, 0)
+        if row < 0 or item is None:
             return
-        player = self._players[row]
+        steamid = item.data(Qt.ItemDataRole.UserRole)
+        player = next((p for p in self._players if p.steamid == steamid), None)
         menu = QMenu(self)
 
-        teleport_menu = menu.addMenu(f"Teleport '{player.name}' to")
-        others = [p for p in self._players if p.entity_id != player.entity_id]
-        if others:
-            for other in others:
-                action = teleport_menu.addAction(other.name)
-                action.triggered.connect(
-                    lambda _checked=False, src=player.name, dst=other.name: self._teleport_to_player(src, dst)
-                )
-            teleport_menu.addSeparator()
-        else:
-            teleport_menu.addAction("(no other players online)").setEnabled(False)
-        coords_action = teleport_menu.addAction("Coordinates...")
-        coords_action.triggered.connect(lambda: self._teleport_to_coords_dialog(player))
+        if player is not None:
+            teleport_menu = menu.addMenu(f"Teleport '{player.name}' to")
+            others = [p for p in self._players if p.entity_id != player.entity_id]
+            if others:
+                for other in others:
+                    action = teleport_menu.addAction(other.name)
+                    action.triggered.connect(
+                        lambda _checked=False, src=player, dst=other.name: self._teleport_to_player(src, dst)
+                    )
+                teleport_menu.addSeparator()
+            else:
+                teleport_menu.addAction("(no other players online)").setEnabled(False)
+            coords_action = teleport_menu.addAction("Coordinates...")
+            coords_action.triggered.connect(lambda: self._teleport_to_coords_dialog(player))
 
-        menu.addSeparator()
-        kick_action = menu.addAction("Kick")
-        kick_action.triggered.connect(lambda: self._kick_player(player))
-        ban_action = menu.addAction("Ban...")
-        ban_action.triggered.connect(lambda: self._ban_dialog_for(player.steamid or player.name))
-        copy_action = menu.addAction("Copy SteamID")
-        copy_action.triggered.connect(lambda: self._copy_to_clipboard(player.steamid))
-        if player.steamid:
-            steam_action = menu.addAction("Open Steam Profile")
-            steam_action.triggered.connect(lambda: self._open_steam_profile(player.steamid))
+            if player.steamid in self._teleport_history:
+                prev = self._teleport_history[player.steamid]
+                return_action = menu.addAction(
+                    f"Return '{player.name}' to previous location  ({prev[0]:.0f}, {prev[1]:.0f}, {prev[2]:.0f})"
+                )
+                return_action.triggered.connect(lambda: self._return_player(player))
+
+            menu.addSeparator()
+            spawn_menu = menu.addMenu(f"Spawn at '{player.name}'")
+            zombie_menu = spawn_menu.addMenu("Zombie")
+            for label, entity_name in _ZOMBIE_TYPES:
+                action = zombie_menu.addAction(label)
+                action.triggered.connect(
+                    lambda _checked=False, p=player, e=entity_name: self._spawn_entity(p, e)
+                )
+            zombie_menu.addSeparator()
+            zombie_custom = zombie_menu.addAction("Custom...")
+            zombie_custom.triggered.connect(lambda _checked=False, p=player: self._spawn_entity_dialog(p))
+
+            animal_menu = spawn_menu.addMenu("Animal")
+            for label, entity_name in _ANIMAL_TYPES:
+                action = animal_menu.addAction(label)
+                action.triggered.connect(
+                    lambda _checked=False, p=player, e=entity_name: self._spawn_entity(p, e)
+                )
+            animal_menu.addSeparator()
+            animal_custom = animal_menu.addAction("Custom...")
+            animal_custom.triggered.connect(lambda _checked=False, p=player: self._spawn_entity_dialog(p))
+
+            menu.addSeparator()
+            kick_action = menu.addAction("Kick")
+            kick_action.triggered.connect(lambda: self._kick_player(player))
+            ban_action = menu.addAction("Ban...")
+            ban_action.triggered.connect(lambda: self._ban_dialog_for(player.steamid or player.name))
+            copy_action = menu.addAction("Copy SteamID")
+            copy_action.triggered.connect(lambda: self._copy_to_clipboard(player.steamid))
+            if player.steamid:
+                steam_action = menu.addAction("Open Steam Profile")
+                steam_action.triggered.connect(lambda: self._open_steam_profile(player.steamid))
+            menu.addSeparator()
+            grant_admin_action = menu.addAction("Grant Admin (Level 0)")
+            grant_admin_action.triggered.connect(lambda: self._admin_grant(player.name, player.name))
+            revoke_admin_action = menu.addAction("Revoke Admin")
+            revoke_admin_action.triggered.connect(lambda: self._admin_revoke(player.name, player.name))
+            menu.addSeparator()
+            reset_action = menu.addAction("Reset Player Stats...")
+            reset_action.triggered.connect(lambda: self._reset_player_stats(player.name, player.steamid, online=True))
+        else:
+            name = self._known_players.get(steamid, {}).get("name", steamid)
+            menu.addAction(f"'{name}' is offline").setEnabled(False)
+            menu.addSeparator()
+            ban_action = menu.addAction("Ban...")
+            ban_action.triggered.connect(lambda: self._ban_dialog_for(steamid or name))
+            copy_action = menu.addAction("Copy SteamID")
+            copy_action.triggered.connect(lambda: self._copy_to_clipboard(steamid))
+            if steamid:
+                steam_action = menu.addAction("Open Steam Profile")
+                steam_action.triggered.connect(lambda: self._open_steam_profile(steamid))
+            if steamid:
+                menu.addSeparator()
+                grant_admin_action = menu.addAction("Grant Admin (Level 0)")
+                grant_admin_action.triggered.connect(
+                    lambda _checked=False, sid=steamid, n=name: self._admin_grant(f"Steam_{sid}", n)
+                )
+                revoke_admin_action = menu.addAction("Revoke Admin")
+                revoke_admin_action.triggered.connect(
+                    lambda _checked=False, sid=steamid, n=name: self._admin_revoke(f"Steam_{sid}", n)
+                )
+            menu.addSeparator()
+            reset_action = menu.addAction("Reset Player Stats...")
+            reset_action.triggered.connect(lambda: self._reset_player_stats(name, steamid, online=False))
+            remove_action = menu.addAction("Remove from history")
+            remove_action.triggered.connect(lambda: self._remove_known_player(steamid))
 
         menu.exec(self.player_table.viewport().mapToGlobal(pos))
 
@@ -899,10 +1228,12 @@ class MainWindow(QMainWindow):
         from PySide6.QtGui import QDesktopServices
         QDesktopServices.openUrl(QUrl("mailto:j71rivera@gmail.com?subject=SJPSM Suggestion"))
 
-    def _teleport_to_player(self, source: str, target: str) -> None:
+    def _teleport_to_player(self, source: Player, target: str) -> None:
         if not self._telnet:
             return
-        self._run_async("teleport", lambda: self._telnet.teleport_to_player(source, target))
+        self._teleport_history[source.steamid] = (source.x, source.y, source.z)
+        name = source.name
+        self._run_async("teleport", lambda: self._telnet.teleport_to_player(name, target))
 
     def _teleport_to_coords_dialog(self, player: Player) -> None:
         dialog = TeleportToCoordsDialog(player.name, self)
@@ -911,7 +1242,54 @@ class MainWindow(QMainWindow):
         dialog.z.setValue(player.z)
         if dialog.exec() == QDialog.DialogCode.Accepted and self._telnet:
             x, y, z = dialog.coords()
+            self._teleport_history[player.steamid] = (player.x, player.y, player.z)
             self._run_async("teleport", lambda: self._telnet.teleport_to_coords(player.name, x, y, z))
+
+    def _return_player(self, player: Player) -> None:
+        if not self._telnet:
+            self.statusBar().showMessage("Return failed: telnet not connected", 5000)
+            return
+        if player.steamid not in self._teleport_history:
+            self.statusBar().showMessage(
+                f"Return failed: no saved position for {player.name} (steamid={player.steamid!r}, "
+                f"history keys={list(self._teleport_history.keys())})", 10000
+            )
+            return
+        x, y, z = self._teleport_history.pop(player.steamid)
+        self.statusBar().showMessage(f"Returning {player.name} to ({x:.0f}, {y:.0f}, {z:.0f})...", 5000)
+        self._run_async("teleport", lambda: self._telnet.teleport_to_coords(player.name, x, y, z))
+
+    def _spawn_entity(self, player: Player, entity_name: str, count: int = 1) -> None:
+        if not self._telnet:
+            return
+        entity_id = player.entity_id
+        self.statusBar().showMessage(f"Spawning {count}x '{entity_name}' at {player.name}...", 4000)
+        self._run_async("spawn_entity", lambda: self._telnet.spawn_entity(entity_id, entity_name, count))
+
+    def _spawn_entity_dialog(self, player: Player) -> None:
+        dialog = SpawnEntityDialog(player.name, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            entity_name, count = dialog.values()
+            if entity_name:
+                self._spawn_entity(player, entity_name, count)
+
+    def _admin_grant(self, identifier: str, display_name: str) -> None:
+        if not self._telnet:
+            return
+        if QMessageBox.question(
+            self, "Grant Admin", f"Grant level 0 (full admin) to '{display_name}'?"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self._run_async("admin_add", lambda: self._telnet.admin_add(identifier, 0, display_name))
+
+    def _admin_revoke(self, identifier: str, display_name: str) -> None:
+        if not self._telnet:
+            return
+        if QMessageBox.question(
+            self, "Revoke Admin", f"Revoke admin permissions from '{display_name}'?"
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self._run_async("admin_remove", lambda: self._telnet.admin_remove(identifier))
 
     def _kick_player(self, player: Player) -> None:
         if not self._telnet:
@@ -920,6 +1298,76 @@ class MainWindow(QMainWindow):
         if not ok:
             return
         self._run_async("kick", lambda: self._telnet.kick(player.name, reason.strip()))
+
+    def _update_known_players(self) -> None:
+        if not self._players:
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        changed = False
+        for player in self._players:
+            if not player.steamid:
+                continue
+            entry = {
+                "steamid": player.steamid,
+                "name": player.name,
+                "level": player.level,
+                "ip": player.ip,
+                "last_seen": now,
+            }
+            if self._known_players.get(player.steamid) != entry:
+                self._known_players[player.steamid] = entry
+                changed = True
+        if changed:
+            self._save_known_players()
+
+    def _save_known_players(self) -> None:
+        self.config.known_players = list(self._known_players.values())
+        if self._save_config_callback:
+            self._save_config_callback(self.config)
+
+    def _clear_player_history(self) -> None:
+        if QMessageBox.question(
+            self, "Clear player history",
+            "Remove all players from the history list?\n\nCurrently online players will reappear immediately.",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self._known_players.clear()
+        self._save_known_players()
+        self._populate_player_table()
+        if self._telnet:
+            self.refresh_players()
+
+    def _remove_known_player(self, steamid: str) -> None:
+        self._known_players.pop(steamid, None)
+        self._save_known_players()
+        self._populate_player_table()
+
+    def _get_xml_setting(self, name: str) -> str:
+        for prop in self._settings_properties:
+            if prop.name.lower() == name.lower():
+                return prop.value
+        return ""
+
+    def _reset_player_stats(self, name: str, steamid: str, *, online: bool) -> None:
+        if not self._sftp:
+            QMessageBox.warning(self, "SFTP not connected", "SFTP must be connected to reset player stats.")
+            return
+        game_world = self._get_xml_setting("GameWorld") or "Navezgane"
+        game_name = self._get_xml_setting("GameName") or "My Game"
+        msg = (
+            f"Delete all save data for '{name}' (SteamID: {steamid})?\n\n"
+            f"GameWorld: {game_world}\nGameName: {game_name}\n\n"
+            "This removes their character, inventory, and map data.\n"
+        )
+        if online:
+            msg += "\nThe player is currently online — kick them first for the reset to take effect cleanly."
+        if QMessageBox.question(self, "Reset player stats — are you sure?", msg) != QMessageBox.StandardButton.Yes:
+            return
+        self.statusBar().showMessage(f"Resetting stats for {name}...", 6000)
+        self._run_async(
+            "reset_stats",
+            lambda: (name, self._sftp.delete_player_data(steamid, game_world, game_name)),
+        )
 
     # -- bans ---------------------------------------------------------------------
 
@@ -1025,6 +1473,14 @@ class MainWindow(QMainWindow):
             return
         self._run_async("sftp_list", lambda: self._do_sftp_list(path))
 
+    def _sftp_navigate_to_typed_path(self) -> None:
+        path = self.sftp_path_edit.text().strip()
+        if not path.startswith("/"):
+            path = f"/{path}"
+        if path != "/":
+            path = path.rstrip("/")
+        self._sftp_browse(path)
+
     def _sftp_go_up(self) -> None:
         if self._sftp_cwd in ("", "/"):
             return
@@ -1041,7 +1497,7 @@ class MainWindow(QMainWindow):
             self._open_sftp_file(self._sftp_join(self._sftp_cwd, entry.name))
 
     def _populate_sftp_list(self) -> None:
-        self.sftp_path_label.setText(self._sftp_cwd)
+        self.sftp_path_edit.setText(self._sftp_cwd)
         self.sftp_list.clear()
         if self._sftp_cwd not in ("", "/"):
             up_item = QListWidgetItem("..")
@@ -1102,6 +1558,9 @@ class MainWindow(QMainWindow):
         delete_action.triggered.connect(lambda: self._delete_sftp_entry(entry, path))
         rename_action = menu.addAction("Rename...")
         rename_action.triggered.connect(lambda: self._rename_sftp_entry(entry, path))
+        chmod_label = "Set Permissions (recursive)..." if entry.is_dir else "Set Permissions..."
+        chmod_action = menu.addAction(chmod_label)
+        chmod_action.triggered.connect(lambda: self._chmod_sftp_entry(entry, path))
         menu.exec(self.sftp_list.viewport().mapToGlobal(pos))
 
     def _delete_sftp_entry(self, entry: FileEntry, path: str) -> None:
@@ -1124,6 +1583,55 @@ class MainWindow(QMainWindow):
         new_path = self._sftp_join(self._sftp_cwd, new_name)
         self._run_async("sftp_rename", lambda: self._do_sftp_rename(path, new_path))
 
+    def _chmod_sftp_entry(self, entry: FileEntry, path: str) -> None:
+        if not self._sftp:
+            return
+        default_mode = "755" if entry.is_dir else "644"
+        prompt = f"Octal permission mode for '{entry.name}'"
+        if entry.is_dir:
+            prompt += " (applied to this folder and everything inside it)"
+        text, ok = QInputDialog.getText(self, "Set Permissions", prompt + ":", QLineEdit.EchoMode.Normal, default_mode)
+        text = text.strip()
+        if not ok or not text:
+            return
+        try:
+            mode = int(text, 8)
+            if not (0 <= mode <= 0o7777):
+                raise ValueError
+        except ValueError:
+            QMessageBox.warning(self, "Invalid mode", "Enter an octal permission mode, e.g. 755 or 644.")
+            return
+        self._run_async("sftp_chmod", lambda: self._do_sftp_chmod(path, mode, entry.is_dir))
+
+    def _upload_sftp_files(self) -> None:
+        if not self._sftp:
+            self.statusBar().showMessage("SFTP is not connected", 4000)
+            return
+        local_paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select files to upload", "", "All Files (*)",
+            options=QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not local_paths:
+            return
+        cwd = self._sftp_cwd
+        self.statusBar().showMessage(f"Uploading {len(local_paths)} file(s)...", 4000)
+        self._run_async("sftp_upload", lambda: self._do_sftp_upload_files(local_paths, cwd))
+
+    def _upload_sftp_folder(self) -> None:
+        if not self._sftp:
+            self.statusBar().showMessage("SFTP is not connected", 4000)
+            return
+        local_dir = QFileDialog.getExistingDirectory(
+            self, "Select folder to upload", "",
+            options=QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not local_dir:
+            return
+        cwd = self._sftp_cwd
+        remote_dir = self._sftp_join(cwd, os.path.basename(local_dir.rstrip("/\\")))
+        self.statusBar().showMessage(f"Uploading folder '{os.path.basename(local_dir)}'...", 4000)
+        self._run_async("sftp_upload", lambda: self._do_sftp_upload_dir(local_dir, remote_dir, cwd))
+
     # -- sftp worker-thread helpers (run off the UI thread via _run_async) -----------
 
     def _do_sftp_list(self, path: str):
@@ -1143,6 +1651,118 @@ class MainWindow(QMainWindow):
     def _do_sftp_rename(self, old_path: str, new_path: str):
         self._sftp.rename(old_path, new_path)
         return old_path, new_path
+
+    def _do_sftp_chmod(self, path: str, mode: int, recursive: bool):
+        if recursive:
+            self._sftp.chmod_recursive(path, mode)
+        else:
+            self._sftp.chmod(path, mode)
+        return path
+
+    def _do_sftp_upload_files(self, local_paths: list[str], remote_dir: str):
+        for local_path in local_paths:
+            remote_path = self._sftp_join(remote_dir, os.path.basename(local_path))
+            self._sftp.upload_file(local_path, remote_path)
+        return remote_dir, len(local_paths)
+
+    def _do_sftp_upload_dir(self, local_dir: str, remote_dir: str, refresh_dir: str):
+        count = self._sftp.upload_dir(local_dir, remote_dir)
+        return refresh_dir, count
+
+    # -- mods -----------------------------------------------------------------------
+
+    def _mods_refresh(self) -> None:
+        if not self._sftp:
+            return
+        self._run_async("mods_list", self._do_mods_list)
+
+    def _populate_mods_list(self) -> None:
+        self.mods_list.clear()
+        locked = set(self.config.locked_mods)
+        for name in sorted(self._mods_entries, key=str.lower):
+            is_locked = name in locked
+            label = f"{name}  [protected]" if is_locked else name
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            if is_locked:
+                item.setForeground(QColor("#888888"))
+                item.setToolTip("Protected — right-click to unlock")
+            else:
+                item.setToolTip("Right-click to remove or lock")
+            self.mods_list.addItem(item)
+        idx = self._left_tabs.indexOf(self._mods_panel)
+        self._left_tabs.setTabText(idx, f"Mods ({len(self._mods_entries)})")
+
+    def _mods_add(self) -> None:
+        if not self._sftp:
+            self.statusBar().showMessage("SFTP is not connected", 4000)
+            return
+        local_dir = QFileDialog.getExistingDirectory(
+            self, "Select mod folder to upload", "",
+            options=QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not local_dir:
+            return
+        mod_name = os.path.basename(local_dir.rstrip("/\\"))
+        remote_dir = self._sftp_join(self.config.mods_dir, mod_name)
+        self.statusBar().showMessage(f"Installing mod '{mod_name}'...", 4000)
+        self._run_async("mods_upload", lambda: self._do_mods_upload(local_dir, remote_dir, mod_name))
+
+    def _show_mods_menu(self, pos) -> None:
+        item = self.mods_list.itemAt(pos)
+        if item is None:
+            return
+        mod_name: str = item.data(Qt.ItemDataRole.UserRole)
+        is_locked = mod_name in self.config.locked_mods
+        menu = QMenu(self)
+        if is_locked:
+            unlock_action = menu.addAction("Unlock (allow removal)")
+            unlock_action.triggered.connect(lambda: self._mods_unlock(mod_name))
+        else:
+            remove_action = menu.addAction(f"Remove '{mod_name}'...")
+            remove_action.triggered.connect(lambda: self._mods_remove(mod_name))
+            menu.addSeparator()
+            lock_action = menu.addAction("Lock (prevent removal)")
+            lock_action.triggered.connect(lambda: self._mods_lock(mod_name))
+        menu.exec(self.mods_list.viewport().mapToGlobal(pos))
+
+    def _mods_lock(self, mod_name: str) -> None:
+        if mod_name not in self.config.locked_mods:
+            self.config.locked_mods.append(mod_name)
+            if self._save_config_callback:
+                self._save_config_callback(self.config)
+        self._populate_mods_list()
+
+    def _mods_unlock(self, mod_name: str) -> None:
+        if mod_name in self.config.locked_mods:
+            self.config.locked_mods.remove(mod_name)
+            if self._save_config_callback:
+                self._save_config_callback(self.config)
+        self._populate_mods_list()
+
+    def _mods_remove(self, mod_name: str) -> None:
+        if not self._sftp:
+            return
+        if QMessageBox.question(
+            self,
+            "Remove mod",
+            f"Permanently delete mod '{mod_name}' from the server?\n\nThis cannot be undone.",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self._run_async("mods_delete", lambda: self._do_mods_delete(mod_name))
+
+    def _do_mods_list(self):
+        entries = self._sftp.list_dir(self.config.mods_dir)
+        return [e.name for e in entries if e.is_dir and not e.name.startswith(".")]
+
+    def _do_mods_upload(self, local_dir: str, remote_dir: str, mod_name: str):
+        count = self._sftp.upload_dir(local_dir, remote_dir)
+        self._sftp.chmod_recursive(remote_dir, 0o755)
+        return mod_name, count
+
+    def _do_mods_delete(self, mod_name: str):
+        self._sftp.delete_dir(self._sftp_join(self.config.mods_dir, mod_name))
+        return mod_name
 
     # -- server settings (serverconfig.xml) ------------------------------------------
 
