@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import random
 import re
+import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -55,6 +57,7 @@ from ratty.pterodactyl_client import ConsoleStream, PterodactylClient, Pterodact
 from ratty.server_config_xml import XmlProperty, apply_property_changes, parse_properties
 from ratty.sftp_client import FileEntry, SftpClient, SftpError
 from ratty.telnet_client import BanEntry, GameTime, LandClaim, Player, TelnetClient, TelnetError
+from ratty.updater import REPO_ROOT, UpdateInfo, apply_update, check_for_update
 
 
 SERVER_CONFIG_PATH = "/serverconfig.xml"
@@ -365,6 +368,12 @@ class MainWindow(QMainWindow):
         self._autorestart_timer.timeout.connect(self._check_autorestart)
         self._autorestart_timer.start(self.AUTO_RESTART_CHECK_INTERVAL_MS)
 
+        self._last_update_prompt_sha: str | None = None
+        self._update_check_timer = QTimer(self)
+        self._update_check_timer.timeout.connect(self._check_for_update)
+        self._update_check_timer.start(self.UPDATE_CHECK_INTERVAL_MS)
+        QTimer.singleShot(3000, self._check_for_update)
+
     # -- window geometry ----------------------------------------------------------
 
     def _restore_window_geometry(self) -> None:
@@ -441,6 +450,11 @@ class MainWindow(QMainWindow):
         bar.addWidget(save_btn)
 
         bar.addStretch(1)
+
+        update_btn = QPushButton("Check for Updates")
+        update_btn.setFlat(True)
+        update_btn.clicked.connect(lambda: self._check_for_update(manual=True))
+        bar.addWidget(update_btn)
 
         suggest_btn = QPushButton("💬 Suggestions")
         suggest_btn.setToolTip("Send suggestions or bug reports to j71rivera@gmail.com")
@@ -1242,6 +1256,11 @@ class MainWindow(QMainWindow):
                     )
         elif tag == "remove_land_claim":
             self.statusBar().showMessage("Land claim removed", 5000)
+        elif tag == "update_check":
+            info, manual = value  # type: ignore[misc]
+            self._on_update_check(info, manual)
+        elif tag == "update_apply":
+            self._on_update_apply(value)  # type: ignore[arg-type]
         elif tag in ("admin_add", "admin_remove"):
             reply = " / ".join(line.strip() for line in value if line.strip())  # type: ignore[union-attr]
             self.statusBar().showMessage(reply or f"{tag} OK", 6000)
@@ -1394,6 +1413,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Upload error", f"Upload failed:\n{message}")
         elif tag == "sftp_chmod":
             QMessageBox.warning(self, "Permissions error", f"Could not change permissions:\n{message}")
+        elif tag == "update_apply":
+            QMessageBox.warning(self, "Update failed", f"Could not update SJPSM:\n{message}")
         elif tag == "reset_stats":
             QMessageBox.warning(self, "Reset failed", f"Could not reset player stats:\n{message}")
         elif tag == "mods_list":
@@ -1409,6 +1430,7 @@ class MainWindow(QMainWindow):
     STOP_WATCHDOG_POLL_MS = 2_000
     STOP_WATCHDOG_SILENCE_SECONDS = 10.0
     AUTO_RESTART_CHECK_INTERVAL_MS = 30_000
+    UPDATE_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000
 
     def refresh_players(self) -> None:
         if not self._telnet:
@@ -1730,6 +1752,39 @@ class MainWindow(QMainWindow):
         from PySide6.QtCore import QUrl
         from PySide6.QtGui import QDesktopServices
         QDesktopServices.openUrl(QUrl("mailto:j71rivera@gmail.com?subject=SJPSM Suggestion"))
+
+    # -- updates ----------------------------------------------------------------
+
+    def _check_for_update(self, manual: bool = False) -> None:
+        if manual:
+            self.statusBar().showMessage("Checking for updates...", 4000)
+        self._run_async("update_check", lambda: (check_for_update(), manual))
+
+    def _on_update_check(self, info: UpdateInfo, manual: bool) -> None:
+        if not info.available:
+            if manual:
+                self.statusBar().showMessage("SJPSM is up to date.", 5000)
+            return
+        if not manual and info.remote_sha == self._last_update_prompt_sha:
+            return  # already asked about this commit -- don't nag every 12h
+        self._last_update_prompt_sha = info.remote_sha
+        commits = "commit" if info.behind_by == 1 else "commits"
+        reply = QMessageBox.question(
+            self,
+            "Update available",
+            f"SJPSM is {info.behind_by} {commits} behind on '{info.branch}'.\n\nUpdate now?",
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.statusBar().showMessage("Updating...", 4000)
+            self._run_async("update_apply", apply_update)
+
+    def _on_update_apply(self, _output: str) -> None:
+        if QMessageBox.question(
+            self, "Update installed", "Updated successfully. Restart SJPSM now to use the new version?"
+        ) == QMessageBox.StandardButton.Yes:
+            from PySide6.QtWidgets import QApplication
+            subprocess.Popen([sys.executable, "-m", "ratty"], cwd=str(REPO_ROOT))
+            QApplication.instance().quit()
 
     def _teleport_to_player(self, source: Player, target: str) -> None:
         if not self._telnet:
