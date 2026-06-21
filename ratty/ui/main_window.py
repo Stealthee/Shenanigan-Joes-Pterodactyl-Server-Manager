@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import os
+import random
 import re
 import threading
+import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from PySide6.QtCore import QObject, QSettings, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QSettings, Qt, QTime, QTimer, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -35,15 +37,24 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from ratty.config import ServerConfig
+from ratty.config import (
+    DEFAULT_DEATH_MESSAGES,
+    DEFAULT_HORDE_SOON_MESSAGE,
+    DEFAULT_HORDE_TODAY_MESSAGE,
+    DEFAULT_JOIN_MESSAGES,
+    DEFAULT_LEVELUP_MESSAGE,
+    DEFAULT_RESTART_WARNING_MESSAGE,
+    ServerConfig,
+)
 from ratty.pterodactyl_client import ConsoleStream, PterodactylClient, PterodactylError
 from ratty.server_config_xml import XmlProperty, apply_property_changes, parse_properties
 from ratty.sftp_client import FileEntry, SftpClient, SftpError
-from ratty.telnet_client import BanEntry, Player, TelnetClient, TelnetError
+from ratty.telnet_client import BanEntry, GameTime, LandClaim, Player, TelnetClient, TelnetError
 
 
 SERVER_CONFIG_PATH = "/serverconfig.xml"
@@ -64,6 +75,16 @@ _STARTUP_OVERRIDES: frozenset[str] = frozenset({
 # Console output lines for in-game chat look like:
 #   Chat (from 'Steam_765xxxxx', entity id '171', to 'Global'): 'PlayerName': hello
 _CHAT_LINE_RE = re.compile(r"Chat \([^)]*\):\s*(?P<text>.*)$")
+
+
+def _land_claim_owner_matches(owner_id: str, steamid: str) -> bool:
+    """Claim owner ids come back as e.g. 'Steam_7656119...' or 'EOS_<hex>' --
+    strip the platform prefix before comparing to our bare-digit Player.steamid."""
+    if not steamid:
+        return False
+    if owner_id.lower().startswith("steam_"):
+        owner_id = owner_id[len("Steam_"):]
+    return owner_id == steamid
 
 # Quick-pick entries for the player "Spawn" submenu, passed straight to the
 # `spawnentity` console command. Pulled from this server's own entity class list
@@ -125,6 +146,15 @@ _ANIMAL_TYPES: tuple[tuple[str, str], ...] = (
     ("Zombie Bear", "animalZombieBear"),
     ("Zombie Boar", "animalZombieBoar"),
     ("Zombie Vulture", "animalZombieVulture"),
+)
+
+# Buff IDs (from vanilla buffs.xml) for the player "Add Injury" submenu.
+_INJURY_TYPES: tuple[tuple[str, str], ...] = (
+    ("Gash (Bleeding)", "buffInjuryBleeding"),
+    ("Sprained Arm", "buffArmSprained"),
+    ("Broken Arm", "buffArmBroken"),
+    ("Sprained Leg", "buffLegSprained"),
+    ("Broken Leg", "buffLegBroken"),
 )
 
 
@@ -200,6 +230,54 @@ class BanDialog(QDialog):
         return self.identifier.text().strip(), self.duration.value(), self.unit_box.currentText(), self.reason.text().strip()
 
 
+class LandClaimsDialog(QDialog):
+    def __init__(self, player_name: str, claims: list[LandClaim], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Land claims -- {player_name}")
+        self._claims = claims
+        self._chosen: LandClaim | None = None
+
+        layout = QVBoxLayout(self)
+        if claims:
+            layout.addWidget(QLabel(f"{len(claims)} claim(s) found. Select one and click Remove."))
+        else:
+            layout.addWidget(QLabel("No land claims found for this player."))
+
+        self.list = QListWidget()
+        for claim in claims:
+            self.list.addItem(f"({claim.x:.0f}, {claim.y:.0f}, {claim.z:.0f})")
+        layout.addWidget(self.list)
+
+        buttons = QHBoxLayout()
+        self.remove_button = QPushButton("Remove Selected")
+        self.remove_button.setEnabled(False)
+        close_button = QPushButton("Close")
+        buttons.addWidget(self.remove_button)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+
+        self.list.currentRowChanged.connect(lambda row: self.remove_button.setEnabled(row >= 0))
+        self.remove_button.clicked.connect(self._on_remove_clicked)
+        close_button.clicked.connect(self.reject)
+
+    def _on_remove_clicked(self) -> None:
+        row = self.list.currentRow()
+        if row < 0:
+            return
+        claim = self._claims[row]
+        if QMessageBox.question(
+            self,
+            "Remove land claim",
+            f"Remove the land claim at ({claim.x:.0f}, {claim.y:.0f}, {claim.z:.0f})?\n\nThis cannot be undone.",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self._chosen = claim
+        self.accept()
+
+    def chosen_claim(self) -> LandClaim | None:
+        return self._chosen
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config: ServerConfig, save_config_callback=None):
         super().__init__()
@@ -230,6 +308,15 @@ class MainWindow(QMainWindow):
         # steamid -> (x, y, z, timestamp) of last known position
         self._position_history: dict[str, tuple[float, float, float, float]] = {}
 
+        # steamid -> last seen level/deaths, for level-up and death broadcasts
+        self._last_known_level: dict[str, int] = {}
+        self._last_known_deaths: dict[str, int] = {}
+        self._last_horde_today_announced_day: int | None = None
+        self._last_horde_soon_announced_day: int | None = None
+        # None until the first player list arrives, so players already online when
+        # the app connects don't all trigger a "just joined" broadcast.
+        self._known_online_steamids: set[str] | None = None
+
         self._sftp_cwd = "/"
         self._sftp_entries: list[FileEntry] = []
         self._sftp_open_path: str | None = None
@@ -252,6 +339,17 @@ class MainWindow(QMainWindow):
         self._sftp_health_timer: QTimer | None = None
         self._game_time_label: QLabel | None = None
 
+        # Stop/restart watchdog -- if the server hangs mid-shutdown (console goes
+        # quiet but power status never reaches its terminal state), force a Kill.
+        self._last_console_line_at: float = 0.0
+        self._ptero_status: str = ""
+        self._stop_watchdog_timer: QTimer | None = None
+        self._stop_watchdog_action: str | None = None
+
+        # Automatic restart schedule.
+        self._next_autorestart_at: float | None = None
+        self._restart_countdown_active = False
+
         self._bridge = _Bridge()
         self._bridge.result.connect(self._on_async_result)
         self._bridge.error.connect(self._on_async_error)
@@ -262,6 +360,10 @@ class MainWindow(QMainWindow):
         self._player_refresh_timer = QTimer(self)
         self._player_refresh_timer.timeout.connect(self.refresh_players)
         self._player_refresh_timer.start(self.PLAYER_REFRESH_INTERVAL_MS)
+
+        self._autorestart_timer = QTimer(self)
+        self._autorestart_timer.timeout.connect(self._check_autorestart)
+        self._autorestart_timer.start(self.AUTO_RESTART_CHECK_INTERVAL_MS)
 
     # -- window geometry ----------------------------------------------------------
 
@@ -338,10 +440,6 @@ class MainWindow(QMainWindow):
             save_btn.setToolTip("Requires a Telnet connection")
         bar.addWidget(save_btn)
 
-        refresh = QPushButton("Refresh players")
-        refresh.clicked.connect(self.refresh_players)
-        bar.addWidget(refresh)
-
         bar.addStretch(1)
 
         suggest_btn = QPushButton("💬 Suggestions")
@@ -382,6 +480,8 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_settings_panel(), "Server Settings")
         self._mods_panel = self._build_mods_panel()
         tabs.addTab(self._mods_panel, "Mods")
+        tabs.addTab(self._build_autorestart_panel(), "Auto Restart")
+        tabs.addTab(self._build_broadcasts_panel(), "Broadcasts")
         self._left_tabs = tabs
         return tabs
 
@@ -452,6 +552,9 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.player_table)
 
         history_row = QHBoxLayout()
+        refresh_btn = QPushButton("Refresh players")
+        refresh_btn.clicked.connect(self.refresh_players)
+        history_row.addWidget(refresh_btn)
         history_row.addStretch(1)
         clear_history_btn = QPushButton("Clear Player History")
         clear_history_btn.setToolTip("Remove everyone from the offline player list -- use after a server wipe.")
@@ -621,6 +724,287 @@ class MainWindow(QMainWindow):
         layout.addLayout(btn_row)
 
         return wrapper
+
+    def _build_autorestart_panel(self) -> QWidget:
+        wrapper = QWidget()
+        layout = QVBoxLayout(wrapper)
+
+        if not self.config.pterodactyl_host:
+            note = QLabel("Automatic restarts require a Pterodactyl connection (not configured for this server).")
+            note.setWordWrap(True)
+            note.setStyleSheet("color: palette(placeholder-text);")
+            layout.addWidget(note)
+
+        enabled_row = QHBoxLayout()
+        self.autorestart_enabled_box = QComboBox()
+        self.autorestart_enabled_box.addItems(["Automatic Restarts: OFF", "Automatic Restarts: ON"])
+        self.autorestart_enabled_box.setCurrentIndex(1 if self.config.autorestart_enabled else 0)
+        enabled_row.addWidget(self.autorestart_enabled_box)
+        enabled_row.addStretch(1)
+        layout.addLayout(enabled_row)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Restart:"))
+        self.autorestart_mode_box = QComboBox()
+        self.autorestart_mode_box.addItems(["At a specific time each day", "Every N hours"])
+        self.autorestart_mode_box.setCurrentIndex(1 if self.config.autorestart_mode == "interval" else 0)
+        mode_row.addWidget(self.autorestart_mode_box)
+        mode_row.addStretch(1)
+        layout.addLayout(mode_row)
+
+        self.autorestart_time_widget = QWidget()
+        time_row = QHBoxLayout(self.autorestart_time_widget)
+        time_row.addWidget(QLabel("Time of day:"))
+        self.autorestart_time_edit = QTimeEdit()
+        self.autorestart_time_edit.setDisplayFormat("HH:mm")
+        hh, _, mm = self.config.autorestart_time.partition(":")
+        self.autorestart_time_edit.setTime(QTime(int(hh or 0), int(mm or 0)))
+        time_row.addWidget(self.autorestart_time_edit)
+        time_row.addStretch(1)
+        layout.addWidget(self.autorestart_time_widget)
+
+        self.autorestart_interval_widget = QWidget()
+        interval_row = QHBoxLayout(self.autorestart_interval_widget)
+        interval_row.addWidget(QLabel("Every:"))
+        self.autorestart_interval_spin = QDoubleSpinBox()
+        self.autorestart_interval_spin.setRange(0.5, 168.0)
+        self.autorestart_interval_spin.setSingleStep(0.5)
+        self.autorestart_interval_spin.setSuffix(" hours")
+        self.autorestart_interval_spin.setValue(self.config.autorestart_interval_hours)
+        interval_row.addWidget(self.autorestart_interval_spin)
+        interval_row.addStretch(1)
+        layout.addWidget(self.autorestart_interval_widget)
+
+        warning_hint = QLabel(
+            "Broadcast 5 minutes and 1 minute before the restart, then a second-by-second "
+            "countdown for the last 20 seconds. Use {minutes}."
+        )
+        warning_hint.setWordWrap(True)
+        warning_hint.setStyleSheet("color: palette(placeholder-text);")
+        layout.addWidget(warning_hint)
+        self.autorestart_warning_edit = QLineEdit(self.config.autorestart_warning_message)
+        layout.addWidget(self.autorestart_warning_edit)
+
+        self.autorestart_status_label = QLabel("")
+        self.autorestart_status_label.setStyleSheet("color: palette(placeholder-text);")
+        layout.addWidget(self.autorestart_status_label)
+
+        layout.addStretch(1)
+
+        self.autorestart_enabled_box.currentIndexChanged.connect(self._save_autorestart_settings)
+        self.autorestart_mode_box.currentIndexChanged.connect(self._save_autorestart_settings)
+        self.autorestart_time_edit.timeChanged.connect(self._save_autorestart_settings)
+        self.autorestart_interval_spin.valueChanged.connect(self._save_autorestart_settings)
+        self.autorestart_warning_edit.editingFinished.connect(self._save_autorestart_settings)
+
+        self._update_autorestart_mode_visibility()
+        self._update_autorestart_status_label()
+        return wrapper
+
+    def _update_autorestart_mode_visibility(self) -> None:
+        is_interval = self.autorestart_mode_box.currentIndex() == 1
+        self.autorestart_time_widget.setVisible(not is_interval)
+        self.autorestart_interval_widget.setVisible(is_interval)
+
+    def _update_autorestart_status_label(self) -> None:
+        if not self.config.autorestart_enabled:
+            self.autorestart_status_label.setText("Automatic restarts are off.")
+        elif self.config.autorestart_mode == "interval":
+            self.autorestart_status_label.setText(
+                f"Restarts the server every {self.config.autorestart_interval_hours:g} hours "
+                "while this app is running."
+            )
+        else:
+            self.autorestart_status_label.setText(
+                f"Restarts the server at {self.config.autorestart_time} every day "
+                "while this app is running."
+            )
+
+    def _save_autorestart_settings(self) -> None:
+        self.config.autorestart_enabled = self.autorestart_enabled_box.currentIndex() == 1
+        self.config.autorestart_mode = "interval" if self.autorestart_mode_box.currentIndex() == 1 else "time"
+        self.config.autorestart_time = self.autorestart_time_edit.time().toString("HH:mm")
+        self.config.autorestart_interval_hours = self.autorestart_interval_spin.value()
+        self.config.autorestart_warning_message = self.autorestart_warning_edit.text().strip() or DEFAULT_RESTART_WARNING_MESSAGE
+        if self._save_config_callback:
+            self._save_config_callback(self.config)
+        self._next_autorestart_at = None
+        self._update_autorestart_mode_visibility()
+        self._update_autorestart_status_label()
+
+    RESTART_WARNING_SECONDS = 300
+    RESTART_FINAL_COUNTDOWN_SECONDS = 20
+
+    def _next_time_mode_restart_at(self, now: datetime) -> datetime:
+        hh, _, mm = self.config.autorestart_time.partition(":")
+        target = now.replace(hour=int(hh or 0), minute=int(mm or 0), second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        return target
+
+    def _check_autorestart(self) -> None:
+        if not self.config.autorestart_enabled or not self._ptero or self._restart_countdown_active:
+            return
+        if self.config.autorestart_mode == "interval":
+            interval_seconds = self.config.autorestart_interval_hours * 3600
+            if self._next_autorestart_at is None:
+                self._next_autorestart_at = time.monotonic() + interval_seconds
+                return
+            seconds_until = self._next_autorestart_at - time.monotonic()
+        else:
+            seconds_until = (self._next_time_mode_restart_at(datetime.now()) - datetime.now()).total_seconds()
+        if seconds_until <= self.RESTART_WARNING_SECONDS:
+            self._begin_restart_countdown(max(seconds_until, 0))
+
+    def _begin_restart_countdown(self, seconds_until: float) -> None:
+        self._restart_countdown_active = True
+        minutes = max(round(seconds_until / 60), 1)
+        self._broadcast_message(self._format_broadcast(self.config.autorestart_warning_message, minutes=minutes))
+
+        one_min_delay = (seconds_until - 60) * 1000
+        if one_min_delay > 0:
+            QTimer.singleShot(int(one_min_delay), lambda: self._broadcast_message(
+                self._format_broadcast(self.config.autorestart_warning_message, minutes=1)
+            ))
+
+        for seconds_left in range(self.RESTART_FINAL_COUNTDOWN_SECONDS, 0, -1):
+            delay = (seconds_until - seconds_left) * 1000
+            if delay > 0:
+                QTimer.singleShot(int(delay), lambda n=seconds_left: self._broadcast_message(str(n)))
+
+        QTimer.singleShot(max(int(seconds_until * 1000), 0), self._finish_restart_countdown)
+
+    def _finish_restart_countdown(self) -> None:
+        self._restart_countdown_active = False
+        self._next_autorestart_at = None
+        self.statusBar().showMessage("Automatic restart triggered", 6000)
+        self._broadcast_message("Restarting now -- back shortly!")
+        self._send_power_action("restart")
+
+    def _build_broadcasts_panel(self) -> QWidget:
+        wrapper = QWidget()
+        layout = QVBoxLayout(wrapper)
+
+        if not self.config.telnet_host:
+            note = QLabel("Server broadcasts require a Telnet connection (not configured for this server).")
+            note.setWordWrap(True)
+            note.setStyleSheet("color: palette(placeholder-text);")
+            layout.addWidget(note)
+
+        join_row = QHBoxLayout()
+        self.broadcast_join_enabled_box = QComboBox()
+        self.broadcast_join_enabled_box.addItems(["Join Messages: OFF", "Join Messages: ON"])
+        self.broadcast_join_enabled_box.setCurrentIndex(1 if self.config.broadcast_join_enabled else 0)
+        join_row.addWidget(self.broadcast_join_enabled_box)
+        join_row.addStretch(1)
+        layout.addLayout(join_row)
+
+        join_hint = QLabel("One is picked at random whenever a player joins. Use {name} -- one message per line.")
+        join_hint.setWordWrap(True)
+        join_hint.setStyleSheet("color: palette(placeholder-text);")
+        layout.addWidget(join_hint)
+        self.broadcast_join_messages_edit = QPlainTextEdit()
+        self.broadcast_join_messages_edit.setPlainText("\n".join(self.config.broadcast_join_messages))
+        self.broadcast_join_messages_edit.setMaximumHeight(120)
+        layout.addWidget(self.broadcast_join_messages_edit)
+
+        death_row = QHBoxLayout()
+        self.broadcast_death_enabled_box = QComboBox()
+        self.broadcast_death_enabled_box.addItems(["Death Messages: OFF", "Death Messages: ON"])
+        self.broadcast_death_enabled_box.setCurrentIndex(1 if self.config.broadcast_death_enabled else 0)
+        death_row.addWidget(self.broadcast_death_enabled_box)
+        death_row.addStretch(1)
+        layout.addLayout(death_row)
+
+        death_hint = QLabel("One is picked at random whenever a player dies. Use {name} for the player's name -- one message per line.")
+        death_hint.setWordWrap(True)
+        death_hint.setStyleSheet("color: palette(placeholder-text);")
+        layout.addWidget(death_hint)
+        self.broadcast_death_messages_edit = QPlainTextEdit()
+        self.broadcast_death_messages_edit.setPlainText("\n".join(self.config.broadcast_death_messages))
+        self.broadcast_death_messages_edit.setMaximumHeight(160)
+        layout.addWidget(self.broadcast_death_messages_edit)
+
+        levelup_row = QHBoxLayout()
+        self.broadcast_levelup_enabled_box = QComboBox()
+        self.broadcast_levelup_enabled_box.addItems(["Level-Up Message: OFF", "Level-Up Message: ON"])
+        self.broadcast_levelup_enabled_box.setCurrentIndex(1 if self.config.broadcast_levelup_enabled else 0)
+        levelup_row.addWidget(self.broadcast_levelup_enabled_box)
+        levelup_row.addStretch(1)
+        layout.addLayout(levelup_row)
+
+        levelup_hint = QLabel("Sent when a player's level goes up. Use {name} and {level}.")
+        levelup_hint.setStyleSheet("color: palette(placeholder-text);")
+        layout.addWidget(levelup_hint)
+        self.broadcast_levelup_message_edit = QLineEdit(self.config.broadcast_levelup_message)
+        layout.addWidget(self.broadcast_levelup_message_edit)
+
+        horde_row = QHBoxLayout()
+        self.broadcast_horde_enabled_box = QComboBox()
+        self.broadcast_horde_enabled_box.addItems(["Horde Warnings: OFF", "Horde Warnings: ON"])
+        self.broadcast_horde_enabled_box.setCurrentIndex(1 if self.config.broadcast_horde_enabled else 0)
+        horde_row.addWidget(self.broadcast_horde_enabled_box)
+        horde_row.addWidget(QLabel("Blood Moon every:"))
+        self.broadcast_horde_frequency_spin = QSpinBox()
+        self.broadcast_horde_frequency_spin.setRange(1, 100)
+        self.broadcast_horde_frequency_spin.setSuffix(" days")
+        self.broadcast_horde_frequency_spin.setValue(self.config.broadcast_horde_frequency_days)
+        self.broadcast_horde_frequency_spin.setToolTip(
+            "This server version doesn't expose Blood Moon Frequency over telnet/SFTP --\n"
+            "set this to match your world's actual setting (vanilla default is 7)."
+        )
+        horde_row.addWidget(self.broadcast_horde_frequency_spin)
+        horde_row.addStretch(1)
+        layout.addLayout(horde_row)
+
+        horde_hint = QLabel("Sent once when the Blood Moon arrives, and once 2 days before. Use {day}.")
+        horde_hint.setStyleSheet("color: palette(placeholder-text);")
+        layout.addWidget(horde_hint)
+        self.broadcast_horde_today_edit = QLineEdit(self.config.broadcast_horde_today_message)
+        layout.addWidget(self.broadcast_horde_today_edit)
+        self.broadcast_horde_soon_edit = QLineEdit(self.config.broadcast_horde_soon_message)
+        layout.addWidget(self.broadcast_horde_soon_edit)
+
+        save_row = QHBoxLayout()
+        save_row.addStretch(1)
+        save_btn = QPushButton("Save Messages")
+        save_btn.clicked.connect(self._save_broadcast_settings)
+        save_row.addWidget(save_btn)
+        layout.addLayout(save_row)
+
+        layout.addStretch(1)
+
+        for box in (
+            self.broadcast_join_enabled_box,
+            self.broadcast_death_enabled_box,
+            self.broadcast_levelup_enabled_box,
+            self.broadcast_horde_enabled_box,
+        ):
+            box.currentIndexChanged.connect(self._save_broadcast_settings)
+        self.broadcast_horde_frequency_spin.valueChanged.connect(self._save_broadcast_settings)
+
+        return wrapper
+
+    def _save_broadcast_settings(self, *_args) -> None:
+        self.config.broadcast_join_enabled = self.broadcast_join_enabled_box.currentIndex() == 1
+        join_messages = [line.strip() for line in self.broadcast_join_messages_edit.toPlainText().splitlines() if line.strip()]
+        self.config.broadcast_join_messages = join_messages or list(DEFAULT_JOIN_MESSAGES)
+
+        self.config.broadcast_death_enabled = self.broadcast_death_enabled_box.currentIndex() == 1
+        messages = [line.strip() for line in self.broadcast_death_messages_edit.toPlainText().splitlines() if line.strip()]
+        self.config.broadcast_death_messages = messages or list(DEFAULT_DEATH_MESSAGES)
+
+        self.config.broadcast_levelup_enabled = self.broadcast_levelup_enabled_box.currentIndex() == 1
+        self.config.broadcast_levelup_message = self.broadcast_levelup_message_edit.text().strip() or DEFAULT_LEVELUP_MESSAGE
+
+        self.config.broadcast_horde_enabled = self.broadcast_horde_enabled_box.currentIndex() == 1
+        self.config.broadcast_horde_frequency_days = self.broadcast_horde_frequency_spin.value()
+        self.config.broadcast_horde_today_message = self.broadcast_horde_today_edit.text().strip() or DEFAULT_HORDE_TODAY_MESSAGE
+        self.config.broadcast_horde_soon_message = self.broadcast_horde_soon_edit.text().strip() or DEFAULT_HORDE_SOON_MESSAGE
+
+        if self._save_config_callback:
+            self._save_config_callback(self.config)
+        self.statusBar().showMessage("Broadcast settings saved", 4000)
 
     def _build_console_panel(self) -> QWidget:
         tabs = QTabWidget()
@@ -836,6 +1220,28 @@ class MainWindow(QMainWindow):
         elif tag == "spawn_entity":
             reply = " / ".join(line.strip() for line in value if line.strip())  # type: ignore[union-attr]
             self.statusBar().showMessage(reply or "Spawn command sent", 6000)
+        elif tag == "apply_buff":
+            reply = " / ".join(line.strip() for line in value if line.strip())  # type: ignore[union-attr]
+            self.statusBar().showMessage(reply or "Buff applied", 6000)
+        elif tag == "cure_injuries":
+            reply = " / ".join(line.strip() for line in value if line.strip())  # type: ignore[union-attr]
+            self.statusBar().showMessage(reply or "Injuries cured", 6000)
+        elif tag == "heal_player":
+            reply = " / ".join(line.strip() for line in value if line.strip())  # type: ignore[union-attr]
+            self.statusBar().showMessage(reply or "Heal complete", 6000)
+        elif tag == "land_claims":
+            steamid, name, claims = value  # type: ignore[misc]
+            matching = [c for c in claims if _land_claim_owner_matches(c.owner_id, steamid)]
+            dialog = LandClaimsDialog(name, matching, self)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                claim = dialog.chosen_claim()
+                if claim is not None and self._telnet:
+                    self._run_async(
+                        "remove_land_claim",
+                        lambda: self._telnet.remove_land_claim(claim.x, claim.y, claim.z),
+                    )
+        elif tag == "remove_land_claim":
+            self.statusBar().showMessage("Land claim removed", 5000)
         elif tag in ("admin_add", "admin_remove"):
             reply = " / ".join(line.strip() for line in value if line.strip())  # type: ignore[union-attr]
             self.statusBar().showMessage(reply or f"{tag} OK", 6000)
@@ -846,19 +1252,28 @@ class MainWindow(QMainWindow):
             if tag == "kick":
                 self.refresh_players()
         elif tag == "game_time":
-            if self._game_time_label is not None and value:
-                self._game_time_label.setText(str(value))
+            game_time = value  # type: ignore[assignment]
+            if self._game_time_label is not None and game_time.display:
+                self._game_time_label.setText(game_time.display)
+            self._check_horde_day(game_time.day)
         elif tag == "save_world":
             self.statusBar().showMessage("World saved -- safe to restart", 6000)
         elif tag == "power_action":
             self.statusBar().showMessage(f"Power action '{value}' sent", 4000)
         elif tag == "console_line":
+            self._last_console_line_at = time.monotonic()
             line = str(value)
             match = _CHAT_LINE_RE.search(line)
             if match:
                 self.chat_view.appendPlainText(match["text"])
             else:
                 self.console_view.appendPlainText(line)
+        elif tag == "ptero_status":
+            self._ptero_status = str(value)
+            if self._stop_watchdog_action == "stop" and self._ptero_status == "offline":
+                self._cancel_stop_watchdog()
+            elif self._stop_watchdog_action == "restart" and self._ptero_status == "running":
+                self._cancel_stop_watchdog()
         elif tag == "sftp_connect":
             self._sftp = value  # type: ignore[assignment]
             self._set_sftp_status(True)
@@ -990,7 +1405,10 @@ class MainWindow(QMainWindow):
 
     # -- players ------------------------------------------------------------------
 
-    PLAYER_REFRESH_INTERVAL_MS = 60_000
+    PLAYER_REFRESH_INTERVAL_MS = 10_000
+    STOP_WATCHDOG_POLL_MS = 2_000
+    STOP_WATCHDOG_SILENCE_SECONDS = 10.0
+    AUTO_RESTART_CHECK_INTERVAL_MS = 30_000
 
     def refresh_players(self) -> None:
         if not self._telnet:
@@ -1047,6 +1465,7 @@ class MainWindow(QMainWindow):
             table.setItem(row, 6, _gray(info.get("last_seen", "")))
             row += 1
         self._check_level_cheaters()
+        self._check_broadcast_events()
 
     def _check_level_cheaters(self) -> None:
         import time as _time
@@ -1099,6 +1518,66 @@ class MainWindow(QMainWindow):
         self._run_async("ban_add", lambda: self._telnet.ban_add(player.steamid, reason=reason))
         self._level_history.pop(player.steamid, None)
         self._position_history.pop(player.steamid, None)
+
+    # -- broadcasts -----------------------------------------------------------------
+
+    def _check_broadcast_events(self) -> None:
+        online = {p.steamid for p in self._players if p.steamid}
+        just_joined = online - self._known_online_steamids if self._known_online_steamids is not None else set()
+
+        for player in self._players:
+            sid = player.steamid
+
+            if sid in just_joined and self.config.broadcast_join_enabled:
+                messages = self.config.broadcast_join_messages or DEFAULT_JOIN_MESSAGES
+                self._broadcast_message(self._format_broadcast(random.choice(messages), name=player.name))
+
+            last_level = self._last_known_level.get(sid)
+            if last_level is not None and player.level > last_level and self.config.broadcast_levelup_enabled:
+                self._broadcast_message(
+                    self._format_broadcast(self.config.broadcast_levelup_message, name=player.name, level=player.level)
+                )
+            self._last_known_level[sid] = player.level
+
+            last_deaths = self._last_known_deaths.get(sid)
+            if last_deaths is not None and player.deaths > last_deaths and self.config.broadcast_death_enabled:
+                messages = self.config.broadcast_death_messages or DEFAULT_DEATH_MESSAGES
+                self._broadcast_message(self._format_broadcast(random.choice(messages), name=player.name))
+            self._last_known_deaths[sid] = player.deaths
+
+        self._known_online_steamids = online
+        for sid in list(self._last_known_level):
+            if sid not in online:
+                del self._last_known_level[sid]
+        for sid in list(self._last_known_deaths):
+            if sid not in online:
+                del self._last_known_deaths[sid]
+
+    def _check_horde_day(self, day: int | None) -> None:
+        if day is None or not self.config.broadcast_horde_enabled:
+            return
+        frequency = self.config.broadcast_horde_frequency_days
+        if frequency <= 0:
+            return
+        days_until = (frequency - (day % frequency)) % frequency
+        if days_until == 0 and self._last_horde_today_announced_day != day:
+            self._last_horde_today_announced_day = day
+            self._broadcast_message(self._format_broadcast(self.config.broadcast_horde_today_message, day=day))
+        elif days_until == 2 and self._last_horde_soon_announced_day != day:
+            self._last_horde_soon_announced_day = day
+            self._broadcast_message(self._format_broadcast(self.config.broadcast_horde_soon_message, day=day))
+
+    @staticmethod
+    def _format_broadcast(template: str, **kwargs) -> str:
+        try:
+            return template.format(**kwargs)
+        except (KeyError, IndexError, ValueError):
+            return template
+
+    def _broadcast_message(self, text: str) -> None:
+        if not self._telnet or not text:
+            return
+        self._run_async("broadcast", lambda: self._telnet.say(text))
 
     def _save_autoban_settings(self, *_args) -> None:
         self.config.autoban_level_enabled = self.autoban_level_enabled.currentIndex() == 1
@@ -1162,6 +1641,22 @@ class MainWindow(QMainWindow):
             animal_custom.triggered.connect(lambda _checked=False, p=player: self._spawn_entity_dialog(p))
 
             menu.addSeparator()
+            injury_menu = menu.addMenu(f"Add Injury to '{player.name}'")
+            for label, buff_name in _INJURY_TYPES:
+                action = injury_menu.addAction(label)
+                action.triggered.connect(
+                    lambda _checked=False, p=player, b=buff_name: self._apply_buff(p, b)
+                )
+            injury_menu.addSeparator()
+            injury_custom = injury_menu.addAction("Custom buff...")
+            injury_custom.triggered.connect(lambda _checked=False, p=player: self._apply_buff_dialog(p))
+
+            cure_action = menu.addAction(f"Cure '{player.name}' of All Injuries")
+            cure_action.triggered.connect(lambda: self._cure_all_injuries(player))
+            heal_action = menu.addAction(f"Heal '{player.name}'")
+            heal_action.triggered.connect(lambda: self._heal_player(player))
+
+            menu.addSeparator()
             kick_action = menu.addAction("Kick")
             kick_action.triggered.connect(lambda: self._kick_player(player))
             ban_action = menu.addAction("Ban...")
@@ -1171,6 +1666,10 @@ class MainWindow(QMainWindow):
             if player.steamid:
                 steam_action = menu.addAction("Open Steam Profile")
                 steam_action.triggered.connect(lambda: self._open_steam_profile(player.steamid))
+                land_claims_action = menu.addAction("Show Land Claims")
+                land_claims_action.triggered.connect(
+                    lambda: self._show_land_claims(player.steamid, player.name)
+                )
             menu.addSeparator()
             grant_admin_action = menu.addAction("Grant Admin (Level 0)")
             grant_admin_action.triggered.connect(lambda: self._admin_grant(player.name, player.name))
@@ -1190,6 +1689,10 @@ class MainWindow(QMainWindow):
             if steamid:
                 steam_action = menu.addAction("Open Steam Profile")
                 steam_action.triggered.connect(lambda: self._open_steam_profile(steamid))
+                land_claims_action = menu.addAction("Show Land Claims")
+                land_claims_action.triggered.connect(
+                    lambda _checked=False, sid=steamid, n=name: self._show_land_claims(sid, n)
+                )
             if steamid:
                 menu.addSeparator()
                 grant_admin_action = menu.addAction("Grant Admin (Level 0)")
@@ -1272,6 +1775,41 @@ class MainWindow(QMainWindow):
             entity_name, count = dialog.values()
             if entity_name:
                 self._spawn_entity(player, entity_name, count)
+
+    def _apply_buff(self, player: Player, buff_name: str) -> None:
+        if not self._telnet:
+            return
+        entity_id = player.entity_id
+        self.statusBar().showMessage(f"Applying '{buff_name}' to {player.name}...", 4000)
+        self._run_async("apply_buff", lambda: self._telnet.apply_buff(entity_id, buff_name))
+
+    def _apply_buff_dialog(self, player: Player) -> None:
+        buff_name, ok = QInputDialog.getText(
+            self, f"Add injury/buff to {player.name}", "Buff ID (e.g. buffLegBroken):"
+        )
+        buff_name = buff_name.strip()
+        if ok and buff_name:
+            self._apply_buff(player, buff_name)
+
+    def _cure_all_injuries(self, player: Player) -> None:
+        if not self._telnet:
+            return
+        entity_id = player.entity_id
+        self.statusBar().showMessage(f"Curing all injuries on {player.name}...", 4000)
+        self._run_async("cure_injuries", lambda: self._telnet.cure_all_injuries(entity_id))
+
+    def _heal_player(self, player: Player) -> None:
+        if not self._telnet:
+            return
+        entity_id = player.entity_id
+        self.statusBar().showMessage(f"Healing {player.name}...", 4000)
+        self._run_async("heal_player", lambda: self._telnet.heal_player(entity_id))
+
+    def _show_land_claims(self, steamid: str, name: str) -> None:
+        if not self._telnet:
+            return
+        self.statusBar().showMessage(f"Looking up land claims for {name}...", 4000)
+        self._run_async("land_claims", lambda: (steamid, name, self._telnet.list_land_claims()))
 
     def _admin_grant(self, identifier: str, display_name: str) -> None:
         if not self._telnet:
@@ -1427,12 +1965,18 @@ class MainWindow(QMainWindow):
     def _start_console_stream(self) -> None:
         if not self._ptero:
             return
-        self._console = ConsoleStream(self._ptero, on_line=self._append_console_line)
+        self._console = ConsoleStream(
+            self._ptero, on_line=self._append_console_line, on_status=self._on_ptero_status
+        )
         self._console.start()
 
     def _append_console_line(self, line: str) -> None:
         # Called from the websocket thread -- marshal to the UI thread.
         self._bridge.result.emit("console_line", line)
+
+    def _on_ptero_status(self, status: str) -> None:
+        # Called from the websocket thread -- marshal to the UI thread.
+        self._bridge.result.emit("ptero_status", status)
 
     def _send_console_command(self) -> None:
         command = self.console_input.text().strip()
@@ -1884,6 +2428,10 @@ class MainWindow(QMainWindow):
             self, "Confirm", f"Are you sure you want to {action} the server?"
         ) != QMessageBox.StandardButton.Yes:
             return
+        if action in ("stop", "restart"):
+            self._start_stop_watchdog(action)
+        else:
+            self._cancel_stop_watchdog()
         self._run_async("power_action", lambda: (self._ptero.send_power_action(action), action)[1])
 
     def _save_world(self) -> None:
@@ -1891,3 +2439,38 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Telnet is not connected", 4000)
             return
         self._run_async("save_world", lambda: self._telnet.run_command("saveworld"))
+
+    # -- stop/restart watchdog ------------------------------------------------------
+    # The egg sometimes saves fast and then just hangs instead of fully exiting.
+    # If the console goes quiet for STOP_WATCHDOG_SILENCE_SECONDS without the power
+    # status reaching its expected terminal state, force a Kill (and for a hung
+    # restart, follow up with Start once it's actually down).
+
+    def _start_stop_watchdog(self, action: str) -> None:
+        self._cancel_stop_watchdog()
+        self._stop_watchdog_action = action
+        self._last_console_line_at = time.monotonic()
+        timer = QTimer(self)
+        timer.timeout.connect(self._check_stop_watchdog)
+        timer.start(self.STOP_WATCHDOG_POLL_MS)
+        self._stop_watchdog_timer = timer
+
+    def _cancel_stop_watchdog(self) -> None:
+        if self._stop_watchdog_timer is not None:
+            self._stop_watchdog_timer.stop()
+            self._stop_watchdog_timer = None
+        self._stop_watchdog_action = None
+
+    def _check_stop_watchdog(self) -> None:
+        if time.monotonic() - self._last_console_line_at < self.STOP_WATCHDOG_SILENCE_SECONDS:
+            return
+        action = self._stop_watchdog_action
+        self._cancel_stop_watchdog()
+        if not self._ptero or action is None:
+            return
+        self.statusBar().showMessage(f"Server hung during {action} -- forcing Kill...", 6000)
+        self._run_async("power_action", lambda: (self._ptero.send_power_action("kill"), "kill")[1])
+        if action == "restart":
+            QTimer.singleShot(5000, lambda: self._run_async(
+                "power_action", lambda: (self._ptero.send_power_action("start"), "start")[1]
+            ))

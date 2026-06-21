@@ -23,6 +23,8 @@ _PLAYER_RE = re.compile(
     r"id=(?P<entity_id>\d+),\s*"
     r"(?P<name>.+?),\s*"
     r"pos=\((?P<x>-?[\d.]+),\s*(?P<y>-?[\d.]+),\s*(?P<z>-?[\d.]+)\).*?"
+    r"health=(?P<health>\d+).*?"
+    r"deaths=(?P<deaths>\d+).*?"
     r"level=(?P<level>\d+).*?"
     r"pltfmid=(?:Steam_)?(?P<steamid>\d+).*?"
     r"ip=(?P<ip>[\d.]+).*?"
@@ -35,6 +37,28 @@ _PLAYER_RE = re.compile(
 # good enough to display, and `raw` is always available as a fallback.
 _BAN_RE = re.compile(r"^(?P<id>\S+)[\s:,\-]*(?P<expires>.*)$")
 
+# `listlandprotection parseable` (Alloc's Server Fixes) emits one of these per
+# claim alongside its human-readable summary line, e.g.:
+#   LandProtectionOf: id=Steam_76561198xxxxxxxxx, playerName=Joe, location=1281, 51, 339
+_LAND_CLAIM_RE = re.compile(
+    r"LandProtectionOf:\s*id=(?P<owner_id>\S+?),\s*playerName=(?P<owner_name>[^,]*),\s*"
+    r"location=(?P<x>-?[\d.]+),\s*(?P<y>-?[\d.]+),\s*(?P<z>-?[\d.]+)"
+)
+
+
+# Vanilla injury/cast/splint buff IDs (from buffs.xml) cleared by "cure all injuries".
+_INJURY_BUFFS: tuple[str, ...] = (
+    "buffInjuryBleeding",
+    "buffArmSprained",
+    "buffArmBroken",
+    "buffArmSplinted",
+    "buffArmCast",
+    "buffLegSprained",
+    "buffLegBroken",
+    "buffLegSplinted",
+    "buffLegCast",
+)
+
 
 @dataclass
 class Player:
@@ -43,6 +67,8 @@ class Player:
     x: float
     y: float
     z: float
+    health: int
+    deaths: int
     level: int
     steamid: str
     ip: str
@@ -54,6 +80,21 @@ class BanEntry:
     identifier: str
     expires: str
     raw: str
+
+
+@dataclass
+class LandClaim:
+    owner_id: str
+    owner_name: str
+    x: float
+    y: float
+    z: float
+
+
+@dataclass
+class GameTime:
+    display: str
+    day: int | None
 
 
 class TelnetError(RuntimeError):
@@ -185,6 +226,8 @@ class TelnetClient:
                     x=float(match["x"]),
                     y=float(match["y"]),
                     z=float(match["z"]),
+                    health=int(match["health"]),
+                    deaths=int(match["deaths"]),
                     level=int(match["level"]),
                     steamid=match["steamid"],
                     ip=match["ip"],
@@ -202,6 +245,37 @@ class TelnetClient:
     def spawn_entity(self, entity_id: int, entity_name: str, count: int = 1) -> list[str]:
         """Spawn `count` of `entity_name` near the entity/player with id `entity_id`."""
         return self.run_command(f"spawnentity {entity_id} {entity_name} {count}")
+
+    def apply_buff(self, entity_id: int, buff_name: str, quiet_seconds: float = 0.5) -> list[str]:
+        return self.run_command(f"buffplayer {entity_id} {buff_name}", quiet_seconds=quiet_seconds)
+
+    def remove_buff(self, entity_id: int, buff_name: str, quiet_seconds: float = 0.5) -> list[str]:
+        return self.run_command(f"debuffplayer {entity_id} {buff_name}", quiet_seconds=quiet_seconds)
+
+    def cure_all_injuries(self, entity_id: int) -> list[str]:
+        """Clear every injury/cast/splint buff vanilla 7D2D can apply to a player."""
+        lines: list[str] = []
+        for buff_name in _INJURY_BUFFS:
+            lines.extend(self.remove_buff(entity_id, buff_name, quiet_seconds=0.2))
+        return lines
+
+    def heal_player(self, entity_id: int, max_attempts: int = 100) -> list[str]:
+        """buffHealHealth only grants a small amount of HP per fresh application before
+        self-removing (it depends on item-set CVars we can't set directly) -- re-apply it
+        and check the player's real health (from `listplayers`) between attempts, stopping
+        as soon as health stops climbing instead of guessing a fixed amount."""
+        player = next((p for p in self.list_players() if p.entity_id == entity_id), None)
+        if player is None:
+            return [f"Player with entity id {entity_id} not found"]
+        start_health = last_health = player.health
+        attempts = 0
+        for attempts in range(1, max_attempts + 1):
+            self.apply_buff(entity_id, "buffHealHealth")
+            player = next((p for p in self.list_players() if p.entity_id == entity_id), None)
+            if player is None or player.health <= last_health:
+                break
+            last_health = player.health
+        return [f"Healed {player.name if player else ''} from {start_health} to {last_health} HP ({attempts} attempts)"]
 
     def ban_add(self, identifier: str, duration: int = 0, unit: str = "forever", reason: str = "") -> list[str]:
         if unit == "forever":
@@ -228,6 +302,26 @@ class TelnetClient:
                 entries.append(BanEntry(identifier=stripped, expires="", raw=stripped))
         return entries
 
+    def list_land_claims(self) -> list[LandClaim]:
+        claims = []
+        for line in self.run_command("listlandprotection parseable"):
+            match = _LAND_CLAIM_RE.search(line)
+            if not match:
+                continue
+            claims.append(
+                LandClaim(
+                    owner_id=match["owner_id"],
+                    owner_name=match["owner_name"].strip(),
+                    x=float(match["x"]),
+                    y=float(match["y"]),
+                    z=float(match["z"]),
+                )
+            )
+        return claims
+
+    def remove_land_claim(self, x: float, y: float, z: float) -> list[str]:
+        return self.run_command(f"removelandprotection {x:.0f} {y:.0f} {z:.0f}")
+
     def admin_add(self, identifier: str, level: int = 0, display_name: str = "") -> list[str]:
         """Grant a permission level (0 = full admin) to a player.
 
@@ -251,11 +345,11 @@ class TelnetClient:
     def say(self, message: str) -> list[str]:
         return self.run_command(f"say \"{message}\"")
 
-    _GAME_TIME_RE = re.compile(r"(Day\s+\d+.*)", re.IGNORECASE)
+    _GAME_TIME_RE = re.compile(r"Day\s+(?P<day>\d+).*", re.IGNORECASE)
 
-    def get_game_time(self) -> str:
+    def get_game_time(self) -> GameTime:
         for line in self.run_command("gettime"):
             match = self._GAME_TIME_RE.search(line)
             if match:
-                return match.group(1).strip()
-        return ""
+                return GameTime(display=match.group(0).strip(), day=int(match["day"]))
+        return GameTime(display="", day=None)
