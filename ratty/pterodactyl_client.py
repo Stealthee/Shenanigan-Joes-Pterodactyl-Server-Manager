@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Callable
+from dataclasses import dataclass
 
 import requests
 import websocket
@@ -19,6 +20,29 @@ PowerAction = str  # "start" | "stop" | "restart" | "kill"
 
 class PterodactylError(RuntimeError):
     pass
+
+
+@dataclass
+class BackupEntry:
+    uuid: str
+    name: str
+    bytes: int
+    is_successful: bool
+    is_locked: bool
+    created_at: str
+    completed_at: str | None
+
+
+def _parse_backup(attrs: dict) -> BackupEntry:
+    return BackupEntry(
+        uuid=attrs["uuid"],
+        name=attrs.get("name") or attrs["uuid"],
+        bytes=attrs.get("bytes") or 0,
+        is_successful=bool(attrs.get("is_successful")),
+        is_locked=bool(attrs.get("is_locked")),
+        created_at=attrs.get("created_at") or "",
+        completed_at=attrs.get("completed_at"),
+    )
 
 
 class PterodactylClient:
@@ -51,6 +75,32 @@ class PterodactylClient:
         resp = self._session.post(self._client_url("/command"), json={"command": command}, timeout=15)
         if resp.status_code >= 400:
             raise PterodactylError(f"Send command failed: {resp.status_code} {resp.text}")
+
+    def list_backups(self) -> list[BackupEntry]:
+        resp = self._session.get(self._client_url("/backups"), timeout=15)
+        if resp.status_code >= 400:
+            raise PterodactylError(f"List backups failed: {resp.status_code} {resp.text}")
+        return [_parse_backup(item["attributes"]) for item in resp.json().get("data", [])]
+
+    def create_backup(self) -> BackupEntry:
+        resp = self._session.post(self._client_url("/backups"), json={}, timeout=30)
+        if resp.status_code >= 400:
+            raise PterodactylError(f"Create backup failed: {resp.status_code} {resp.text}")
+        return _parse_backup(resp.json()["attributes"])
+
+    def delete_backup(self, backup_uuid: str) -> None:
+        resp = self._session.delete(self._client_url(f"/backups/{backup_uuid}"), timeout=15)
+        if resp.status_code >= 400:
+            raise PterodactylError(f"Delete backup failed: {resp.status_code} {resp.text}")
+
+    def restore_backup(self, backup_uuid: str) -> None:
+        resp = self._session.post(
+            self._client_url(f"/backups/{backup_uuid}/restore"),
+            json={"truncate": True},
+            timeout=30,
+        )
+        if resp.status_code >= 400:
+            raise PterodactylError(f"Restore backup failed: {resp.status_code} {resp.text}")
 
     def _websocket_credentials(self) -> tuple[str, str]:
         resp = self._session.get(self._client_url("/websocket"), timeout=15)

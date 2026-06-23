@@ -237,7 +237,10 @@ class TelnetClient:
         return players
 
     def teleport_to_coords(self, player: str, x: float, y: float, z: float) -> list[str]:
-        return self.run_command(f"teleportplayer \"{player}\" {x:.1f} {y:.1f} {z:.1f}")
+        # teleportplayer rejects non-integer coordinates with "x argument is
+        # not a valid integer" and silently does nothing -- confirmed live
+        # 2026-06-22. Must round, not just truncate the formatting.
+        return self.run_command(f"teleportplayer \"{player}\" {round(x)} {round(y)} {round(z)}")
 
     def teleport_to_player(self, player: str, target: str) -> list[str]:
         return self.run_command(f"teleportplayer \"{player}\" \"{target}\"")
@@ -301,6 +304,10 @@ class TelnetClient:
             else:
                 entries.append(BanEntry(identifier=stripped, expires="", raw=stripped))
         return entries
+
+    def show_inventory(self, entity_id: int) -> list[str]:
+        """ASF extension -- dumps a player's full inventory/equipment/toolbelt to console."""
+        return self.run_command(f"showinventory {entity_id}")
 
     def list_land_claims(self) -> list[LandClaim]:
         claims = []

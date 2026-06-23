@@ -53,7 +53,7 @@ from ratty.config import (
     DEFAULT_RESTART_WARNING_MESSAGE,
     ServerConfig,
 )
-from ratty.pterodactyl_client import ConsoleStream, PterodactylClient, PterodactylError
+from ratty.pterodactyl_client import BackupEntry, ConsoleStream, PterodactylClient, PterodactylError
 from ratty.server_config_xml import XmlProperty, apply_property_changes, parse_properties
 from ratty.sftp_client import FileEntry, SftpClient, SftpError
 from ratty.telnet_client import BanEntry, GameTime, LandClaim, Player, TelnetClient, TelnetError
@@ -61,6 +61,10 @@ from ratty.updater import REPO_ROOT, UpdateInfo, apply_update, check_for_update
 
 
 SERVER_CONFIG_PATH = "/serverconfig.xml"
+
+# Pterodactyl panel backup limit for this server -- creating past this fails
+# server-side, so the Backups tab offers to delete the oldest one to make room.
+BACKUP_LIMIT = 5
 
 # Properties whose values are passed as command-line flags in the Pterodactyl
 # egg startup command, overriding whatever is written in serverconfig.xml.
@@ -88,6 +92,24 @@ def _land_claim_owner_matches(owner_id: str, steamid: str) -> bool:
     if owner_id.lower().startswith("steam_"):
         owner_id = owner_id[len("Steam_"):]
     return owner_id == steamid
+
+
+def _format_bytes(num_bytes: int) -> str:
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def _format_timestamp(value: str | None) -> str:
+    if not value:
+        return "--"
+    try:
+        return datetime.fromisoformat(value).strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return value
 
 # Quick-pick entries for the player "Spawn" submenu, passed straight to the
 # `spawnentity` console command. Pulled from this server's own entity class list
@@ -281,6 +303,56 @@ class LandClaimsDialog(QDialog):
         return self._chosen
 
 
+class InventoryDialog(QDialog):
+    def __init__(self, player_name: str, lines: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Inventory -- {player_name}")
+        self.resize(500, 500)
+
+        layout = QVBoxLayout(self)
+        text = QPlainTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText("\n".join(lines) if lines else "(no inventory data returned)")
+        layout.addWidget(text)
+
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.accept)
+        layout.addWidget(close_button)
+
+
+class RestartCountdownDialog(QDialog):
+    """Non-modal "restart pending" banner with a cancel button.
+
+    Closing it any way (Cancel button or the window's own close button) aborts
+    the pending restart -- the close path is the cancel path.
+    """
+
+    cancelled = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Restart Pending")
+        self.setModal(False)
+        self._cancel_emitted = False
+
+        layout = QVBoxLayout(self)
+        self.label = QLabel("")
+        self.label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self.label)
+        cancel_btn = QPushButton("Cancel Restart")
+        cancel_btn.clicked.connect(self.close)
+        layout.addWidget(cancel_btn)
+
+    def set_text(self, text: str) -> None:
+        self.label.setText(text)
+
+    def closeEvent(self, event) -> None:
+        if not self._cancel_emitted:
+            self._cancel_emitted = True
+            self.cancelled.emit()
+        super().closeEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config: ServerConfig, save_config_callback=None):
         super().__init__()
@@ -328,6 +400,9 @@ class MainWindow(QMainWindow):
 
         self._mods_entries: list[str] = []
 
+        self._backups: list[BackupEntry] = []
+        self._backups_poll_timer: QTimer | None = None
+
         self._settings_xml: str | None = None
         self._settings_properties: list[XmlProperty] = []
         self._settings_widgets: dict[str, QWidget] = {}
@@ -341,6 +416,8 @@ class MainWindow(QMainWindow):
         self._sftp_reconnect_timer: QTimer | None = None
         self._sftp_health_timer: QTimer | None = None
         self._game_time_label: QLabel | None = None
+        self._next_horde_label: QLabel | None = None
+        self._current_game_day: int | None = None
 
         # Stop/restart watchdog -- if the server hangs mid-shutdown (console goes
         # quiet but power status never reaches its terminal state), force a Kill.
@@ -352,6 +429,10 @@ class MainWindow(QMainWindow):
         # Automatic restart schedule.
         self._next_autorestart_at: float | None = None
         self._restart_countdown_active = False
+        self._restart_countdown_timer: QTimer | None = None
+        self._restart_countdown_dialog: RestartCountdownDialog | None = None
+        self._restart_seconds_remaining = 0
+        self._restart_warned_one_minute = False
 
         self._bridge = _Bridge()
         self._bridge.result.connect(self._on_async_result)
@@ -421,6 +502,13 @@ class MainWindow(QMainWindow):
             self._game_time_label.setToolTip("Current in-game day and time")
             bar.addWidget(self._game_time_label)
 
+            self._next_horde_label = QLabel("")
+            self._next_horde_label.setStyleSheet("color: white; font-weight: bold; margin-left: 6px;")
+            self._next_horde_label.setToolTip(
+                "Next Blood Moon horde day, from this world's BloodMoonFrequency/BloodMoonRange settings"
+            )
+            bar.addWidget(self._next_horde_label)
+
         bar.addStretch(1)
 
         has_ptero = bool(self.config.pterodactyl_host)
@@ -429,7 +517,10 @@ class MainWindow(QMainWindow):
         self.power_buttons: list[QPushButton] = []
         for label, action in (("Start", "start"), ("Restart", "restart"), ("Stop", "stop"), ("Kill", "kill")):
             btn = QPushButton(label)
-            btn.clicked.connect(lambda _checked=False, a=action: self._send_power_action(a))
+            if action == "restart":
+                btn.clicked.connect(self._on_restart_clicked)
+            else:
+                btn.clicked.connect(lambda _checked=False, a=action: self._send_power_action(a))
             if not has_ptero:
                 btn.setEnabled(False)
                 btn.setToolTip(no_ptero_tip)
@@ -494,6 +585,8 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_settings_panel(), "Server Settings")
         self._mods_panel = self._build_mods_panel()
         tabs.addTab(self._mods_panel, "Mods")
+        self._backups_panel = self._build_backups_panel()
+        tabs.addTab(self._backups_panel, "Backups")
         tabs.addTab(self._build_autorestart_panel(), "Auto Restart")
         tabs.addTab(self._build_broadcasts_panel(), "Broadcasts")
         self._left_tabs = tabs
@@ -739,6 +832,49 @@ class MainWindow(QMainWindow):
 
         return wrapper
 
+    def _build_backups_panel(self) -> QWidget:
+        wrapper = QWidget()
+        layout = QVBoxLayout(wrapper)
+
+        if not self.config.pterodactyl_host:
+            note = QLabel("Backups require a Pterodactyl connection (not configured for this server).")
+            note.setWordWrap(True)
+            note.setStyleSheet("color: palette(placeholder-text);")
+            layout.addWidget(note)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel(f"The panel keeps the {BACKUP_LIMIT} most recent backups."))
+        top_row.addStretch(1)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self._backups_refresh)
+        top_row.addWidget(refresh_btn)
+        backup_now_btn = QPushButton("Backup Now")
+        backup_now_btn.setStyleSheet("font-weight: bold;")
+        backup_now_btn.clicked.connect(self._backup_now)
+        top_row.addWidget(backup_now_btn)
+        layout.addLayout(top_row)
+
+        self.backups_table = QTableWidget(0, 4)
+        self.backups_table.setHorizontalHeaderLabels(["Name", "Created", "Size", "Status"])
+        self.backups_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.backups_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.backups_table.horizontalHeader().setStretchLastSection(True)
+        self.backups_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.backups_table.customContextMenuRequested.connect(self._show_backups_menu)
+        layout.addWidget(self.backups_table, 1)
+
+        btn_row = QHBoxLayout()
+        restore_btn = QPushButton("Restore Selected...")
+        restore_btn.clicked.connect(self._restore_selected_backup)
+        btn_row.addWidget(restore_btn)
+        delete_btn = QPushButton("Delete Selected...")
+        delete_btn.clicked.connect(self._delete_selected_backup)
+        btn_row.addWidget(delete_btn)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+
+        return wrapper
+
     def _build_autorestart_panel(self) -> QWidget:
         wrapper = QWidget()
         layout = QVBoxLayout(wrapper)
@@ -872,26 +1008,66 @@ class MainWindow(QMainWindow):
 
     def _begin_restart_countdown(self, seconds_until: float) -> None:
         self._restart_countdown_active = True
+        self._restart_seconds_remaining = max(round(seconds_until), 0)
+        self._restart_warned_one_minute = False
+
         minutes = max(round(seconds_until / 60), 1)
         self._broadcast_message(self._format_broadcast(self.config.autorestart_warning_message, minutes=minutes))
 
-        one_min_delay = (seconds_until - 60) * 1000
-        if one_min_delay > 0:
-            QTimer.singleShot(int(one_min_delay), lambda: self._broadcast_message(
-                self._format_broadcast(self.config.autorestart_warning_message, minutes=1)
-            ))
+        self._restart_countdown_dialog = RestartCountdownDialog(self)
+        self._restart_countdown_dialog.cancelled.connect(self._cancel_restart_countdown)
+        self._update_restart_countdown_dialog()
+        self._restart_countdown_dialog.show()
 
-        for seconds_left in range(self.RESTART_FINAL_COUNTDOWN_SECONDS, 0, -1):
-            delay = (seconds_until - seconds_left) * 1000
-            if delay > 0:
-                QTimer.singleShot(int(delay), lambda n=seconds_left: self._broadcast_message(str(n)))
+        timer = QTimer(self)
+        timer.timeout.connect(self._tick_restart_countdown)
+        timer.start(1000)
+        self._restart_countdown_timer = timer
 
-        QTimer.singleShot(max(int(seconds_until * 1000), 0), self._finish_restart_countdown)
+    def _tick_restart_countdown(self) -> None:
+        self._restart_seconds_remaining -= 1
+        remaining = self._restart_seconds_remaining
+        self._update_restart_countdown_dialog()
+
+        if remaining <= 0:
+            self._finish_restart_countdown()
+        elif remaining == 60 and not self._restart_warned_one_minute:
+            self._restart_warned_one_minute = True
+            self._broadcast_message(self._format_broadcast(self.config.autorestart_warning_message, minutes=1))
+        elif remaining <= self.RESTART_FINAL_COUNTDOWN_SECONDS:
+            self._broadcast_message(str(remaining))
+
+    def _update_restart_countdown_dialog(self) -> None:
+        if self._restart_countdown_dialog is None:
+            return
+        minutes, seconds = divmod(max(self._restart_seconds_remaining, 0), 60)
+        self._restart_countdown_dialog.set_text(f"Restarting in {minutes}:{seconds:02d}...")
+
+    def _stop_restart_countdown_timer(self) -> None:
+        if self._restart_countdown_timer is not None:
+            self._restart_countdown_timer.stop()
+            self._restart_countdown_timer = None
+
+    def _cancel_restart_countdown(self) -> None:
+        if not self._restart_countdown_active:
+            return
+        self._restart_countdown_active = False
+        self._stop_restart_countdown_timer()
+        self._restart_countdown_dialog = None
+        self._next_autorestart_at = None
+        self.statusBar().showMessage("Restart cancelled", 5000)
+        self._broadcast_message("Restart cancelled -- carry on!")
 
     def _finish_restart_countdown(self) -> None:
+        self._stop_restart_countdown_timer()
+        if self._restart_countdown_dialog is not None:
+            dialog = self._restart_countdown_dialog
+            self._restart_countdown_dialog = None
+            dialog.cancelled.disconnect(self._cancel_restart_countdown)
+            dialog.close()
         self._restart_countdown_active = False
         self._next_autorestart_at = None
-        self.statusBar().showMessage("Automatic restart triggered", 6000)
+        self.statusBar().showMessage("Restart triggered", 6000)
         self._broadcast_message("Restarting now -- back shortly!")
         self._send_power_action("restart")
 
@@ -1222,6 +1398,7 @@ class MainWindow(QMainWindow):
             self._ptero = value  # type: ignore[assignment]
             self.statusBar().showMessage("Pterodactyl connected", 5000)
             self._start_console_stream()
+            self._backups_refresh()
         elif tag == "list_players":
             self._players = value  # type: ignore[assignment]
             self._update_known_players()
@@ -1231,6 +1408,11 @@ class MainWindow(QMainWindow):
         elif tag == "teleport":
             reply = " / ".join(line.strip() for line in value if line.strip())  # type: ignore[union-attr]
             self.statusBar().showMessage(reply or "Teleport command sent", 6000)
+        elif tag == "teleport_return":
+            steamid, name, lines = value  # type: ignore[misc]
+            self._teleport_history.pop(steamid, None)
+            reply = " / ".join(line.strip() for line in lines if line.strip())
+            self.statusBar().showMessage(reply or f"{name} returned to previous location", 6000)
         elif tag == "spawn_entity":
             reply = " / ".join(line.strip() for line in value if line.strip())  # type: ignore[union-attr]
             self.statusBar().showMessage(reply or "Spawn command sent", 6000)
@@ -1243,6 +1425,10 @@ class MainWindow(QMainWindow):
         elif tag == "heal_player":
             reply = " / ".join(line.strip() for line in value if line.strip())  # type: ignore[union-attr]
             self.statusBar().showMessage(reply or "Heal complete", 6000)
+        elif tag == "show_inventory":
+            name, lines = value  # type: ignore[misc]
+            dialog = InventoryDialog(name, [line for line in lines if line.strip()], self)
+            dialog.exec()
         elif tag == "land_claims":
             steamid, name, claims = value  # type: ignore[misc]
             matching = [c for c in claims if _land_claim_owner_matches(c.owner_id, steamid)]
@@ -1274,6 +1460,8 @@ class MainWindow(QMainWindow):
             game_time = value  # type: ignore[assignment]
             if self._game_time_label is not None and game_time.display:
                 self._game_time_label.setText(game_time.display)
+            self._current_game_day = game_time.day
+            self._update_next_horde_label()
             self._check_horde_day(game_time.day)
         elif tag == "save_world":
             self.statusBar().showMessage("World saved -- safe to restart", 6000)
@@ -1363,11 +1551,13 @@ class MainWindow(QMainWindow):
             self._settings_xml = xml_text
             self._settings_properties = parse_properties(xml_text)
             self._populate_settings_form()
+            self._update_next_horde_label()
             self.statusBar().showMessage("Loaded serverconfig.xml", 4000)
         elif tag == "settings_save":
             self._settings_xml = str(value)
             self._settings_properties = parse_properties(self._settings_xml)
             self._populate_settings_form()
+            self._update_next_horde_label()
             self.statusBar().showMessage("Saved serverconfig.xml", 5000)
             QMessageBox.information(
                 self,
@@ -1386,6 +1576,18 @@ class MainWindow(QMainWindow):
         elif tag == "mods_delete":
             self.statusBar().showMessage(f"Removed mod '{value}'", 5000)
             self._mods_refresh()
+        elif tag == "backups_list":
+            self._backups = value  # type: ignore[assignment]
+            self._populate_backups_table()
+        elif tag == "backup_create":
+            backup = value  # type: ignore[assignment]
+            self.statusBar().showMessage(f"Backup '{backup.name}' started", 5000)
+            self._backups_refresh()
+        elif tag == "backup_restore":
+            self.statusBar().showMessage(f"Restore of '{value}' started", 6000)
+        elif tag == "backup_delete":
+            self.statusBar().showMessage(f"Deleted backup '{value}'", 4000)
+            self._backups_refresh()
 
     def _on_async_error(self, tag: str, message: str) -> None:
         self.statusBar().showMessage(f"{tag} failed: {message}", 8000)
@@ -1423,6 +1625,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Upload failed", f"Could not install mod:\n{message}")
         elif tag == "mods_delete":
             QMessageBox.warning(self, "Remove failed", f"Could not remove mod:\n{message}")
+        elif tag == "backup_create":
+            QMessageBox.warning(self, "Backup failed", f"Could not start backup:\n{message}")
+        elif tag == "backup_restore":
+            QMessageBox.warning(self, "Restore failed", f"Could not restore backup:\n{message}")
+        elif tag == "backup_delete":
+            QMessageBox.warning(self, "Delete failed", f"Could not delete backup:\n{message}")
 
     # -- players ------------------------------------------------------------------
 
@@ -1575,6 +1783,40 @@ class MainWindow(QMainWindow):
             if sid not in online:
                 del self._last_known_deaths[sid]
 
+    def _settings_property_value(self, name: str) -> str | None:
+        for prop in self._settings_properties:
+            if prop.name == name:
+                return prop.value
+        return None
+
+    def _update_next_horde_label(self) -> None:
+        if self._next_horde_label is None:
+            return
+        day = self._current_game_day
+        if day is None:
+            self._next_horde_label.setText("")
+            return
+
+        frequency_raw = self._settings_property_value("BloodMoonFrequency")
+        try:
+            frequency = int(frequency_raw) if frequency_raw is not None else self.config.broadcast_horde_frequency_days
+        except ValueError:
+            frequency = self.config.broadcast_horde_frequency_days
+
+        range_raw = self._settings_property_value("BloodMoonRange")
+        try:
+            horde_range = int(range_raw) if range_raw is not None else 0
+        except ValueError:
+            horde_range = 0
+
+        if frequency <= 0:
+            self._next_horde_label.setText("Next Horde: Disabled")
+        elif horde_range != 0:
+            self._next_horde_label.setText("Next Horde: Any")
+        else:
+            days_until = (frequency - (day % frequency)) % frequency
+            self._next_horde_label.setText(f"Next Horde: Day {day + days_until}")
+
     def _check_horde_day(self, day: int | None) -> None:
         if day is None or not self.config.broadcast_horde_enabled:
             return
@@ -1677,6 +1919,8 @@ class MainWindow(QMainWindow):
             cure_action.triggered.connect(lambda: self._cure_all_injuries(player))
             heal_action = menu.addAction(f"Heal '{player.name}'")
             heal_action.triggered.connect(lambda: self._heal_player(player))
+            inventory_action = menu.addAction(f"Show Inventory ('{player.name}')")
+            inventory_action.triggered.connect(lambda: self._show_inventory(player))
 
             menu.addSeparator()
             kick_action = menu.addAction("Kick")
@@ -1808,14 +2052,19 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Return failed: telnet not connected", 5000)
             return
         if player.steamid not in self._teleport_history:
-            self.statusBar().showMessage(
-                f"Return failed: no saved position for {player.name} (steamid={player.steamid!r}, "
-                f"history keys={list(self._teleport_history.keys())})", 10000
-            )
+            self.statusBar().showMessage(f"Return failed: no saved position for {player.name}", 6000)
             return
-        x, y, z = self._teleport_history.pop(player.steamid)
-        self.statusBar().showMessage(f"Returning {player.name} to ({x:.0f}, {y:.0f}, {z:.0f})...", 5000)
-        self._run_async("teleport", lambda: self._telnet.teleport_to_coords(player.name, x, y, z))
+        # Don't pop until the teleport actually succeeds -- otherwise a failed
+        # attempt (telnet hiccup, command error) silently loses the saved spot
+        # with no way to retry.
+        x, y, z = self._teleport_history[player.steamid]
+        steamid = player.steamid
+        name = player.name
+        self.statusBar().showMessage(f"Returning {name} to ({x:.0f}, {y:.0f}, {z:.0f})...", 5000)
+        self._run_async(
+            "teleport_return",
+            lambda: (steamid, name, self._telnet.teleport_to_coords(name, x, y, z)),
+        )
 
     def _spawn_entity(self, player: Player, entity_name: str, count: int = 1) -> None:
         if not self._telnet:
@@ -1859,6 +2108,14 @@ class MainWindow(QMainWindow):
         entity_id = player.entity_id
         self.statusBar().showMessage(f"Healing {player.name}...", 4000)
         self._run_async("heal_player", lambda: self._telnet.heal_player(entity_id))
+
+    def _show_inventory(self, player: Player) -> None:
+        if not self._telnet:
+            return
+        entity_id = player.entity_id
+        name = player.name
+        self.statusBar().showMessage(f"Fetching inventory for {name}...", 4000)
+        self._run_async("show_inventory", lambda: (name, self._telnet.show_inventory(entity_id)))
 
     def _show_land_claims(self, steamid: str, name: str) -> None:
         if not self._telnet:
@@ -2363,6 +2620,144 @@ class MainWindow(QMainWindow):
         self._sftp.delete_dir(self._sftp_join(self.config.mods_dir, mod_name))
         return mod_name
 
+    # -- backups --------------------------------------------------------------------
+
+    BACKUPS_POLL_INTERVAL_MS = 5_000
+
+    def _backups_refresh(self) -> None:
+        if not self._ptero:
+            return
+        self._run_async("backups_list", self._ptero.list_backups)
+
+    def _populate_backups_table(self) -> None:
+        entries = sorted(self._backups, key=lambda b: b.created_at, reverse=True)
+        table = self.backups_table
+        table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            if entry.completed_at is None:
+                status = "In progress"
+            else:
+                status = "Completed" if entry.is_successful else "Failed"
+            if entry.is_locked:
+                status += " (locked)"
+            name_item = QTableWidgetItem(entry.name)
+            name_item.setData(Qt.ItemDataRole.UserRole, entry.uuid)
+            table.setItem(row, 0, name_item)
+            table.setItem(row, 1, QTableWidgetItem(_format_timestamp(entry.created_at)))
+            table.setItem(row, 2, QTableWidgetItem(_format_bytes(entry.bytes)))
+            table.setItem(row, 3, QTableWidgetItem(status))
+        table.resizeColumnsToContents()
+        idx = self._left_tabs.indexOf(self._backups_panel)
+        self._left_tabs.setTabText(idx, f"Backups ({len(entries)}/{BACKUP_LIMIT})")
+
+        if any(e.completed_at is None for e in entries):
+            self._start_backups_poll()
+        else:
+            self._stop_backups_poll()
+
+    def _start_backups_poll(self) -> None:
+        if self._backups_poll_timer is not None:
+            return
+        timer = QTimer(self)
+        timer.timeout.connect(self._backups_refresh)
+        timer.start(self.BACKUPS_POLL_INTERVAL_MS)
+        self._backups_poll_timer = timer
+
+    def _stop_backups_poll(self) -> None:
+        if self._backups_poll_timer is not None:
+            self._backups_poll_timer.stop()
+            self._backups_poll_timer = None
+
+    def _selected_backup(self) -> BackupEntry | None:
+        row = self.backups_table.currentRow()
+        if row < 0:
+            return None
+        uuid = self.backups_table.item(row, 0).data(Qt.ItemDataRole.UserRole)
+        return next((b for b in self._backups if b.uuid == uuid), None)
+
+    def _backup_now(self) -> None:
+        if not self._ptero:
+            self.statusBar().showMessage("Pterodactyl is not connected", 4000)
+            return
+        if len(self._backups) >= BACKUP_LIMIT:
+            oldest = min(self._backups, key=lambda b: b.created_at)
+            if QMessageBox.question(
+                self,
+                "Backup limit reached",
+                f"This server already has {BACKUP_LIMIT} backups (the max kept).\n\n"
+                f"Delete the oldest one, '{oldest.name}' (created {_format_timestamp(oldest.created_at)}), "
+                "to make room for a new backup?",
+            ) != QMessageBox.StandardButton.Yes:
+                return
+            self.statusBar().showMessage("Deleting oldest backup and starting a new one...", 4000)
+            self._run_async("backup_create", lambda: self._do_backup_now(oldest.uuid))
+        else:
+            self.statusBar().showMessage("Starting backup...", 4000)
+            self._run_async("backup_create", lambda: self._do_backup_now(None))
+
+    def _do_backup_now(self, delete_uuid: str | None) -> BackupEntry:
+        if delete_uuid:
+            self._ptero.delete_backup(delete_uuid)
+        return self._ptero.create_backup()
+
+    def _restore_selected_backup(self) -> None:
+        backup = self._selected_backup()
+        if backup is None or not self._ptero:
+            self.statusBar().showMessage("Select a backup to restore", 4000)
+            return
+        if backup.completed_at is None:
+            self.statusBar().showMessage("That backup is still in progress", 4000)
+            return
+        if not backup.is_successful:
+            QMessageBox.warning(self, "Restore", "That backup failed and can't be restored.")
+            return
+        running_note = (
+            "\n\nThe server is currently running -- stop it before restoring, "
+            "or the panel may reject this."
+            if self._ptero_status not in ("", "offline")
+            else ""
+        )
+        if QMessageBox.question(
+            self,
+            "Restore backup -- are you sure?",
+            f"Restore '{backup.name}' (created {_format_timestamp(backup.created_at)})?\n\n"
+            "This OVERWRITES the server's current files with the backup's contents "
+            f"and cannot be undone.{running_note}",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self.statusBar().showMessage(f"Restoring backup '{backup.name}'...", 6000)
+        self._run_async("backup_restore", lambda: (self._ptero.restore_backup(backup.uuid), backup.name)[1])
+
+    def _delete_selected_backup(self) -> None:
+        backup = self._selected_backup()
+        if backup is None or not self._ptero:
+            self.statusBar().showMessage("Select a backup to delete", 4000)
+            return
+        if QMessageBox.question(
+            self,
+            "Delete backup",
+            f"Permanently delete backup '{backup.name}' (created {_format_timestamp(backup.created_at)})?\n\n"
+            "This cannot be undone.",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self._run_async("backup_delete", lambda: (self._ptero.delete_backup(backup.uuid), backup.name)[1])
+
+    def _show_backups_menu(self, pos) -> None:
+        row = self.backups_table.rowAt(pos.y())
+        if row < 0:
+            return
+        self.backups_table.selectRow(row)
+        backup = self._selected_backup()
+        if backup is None:
+            return
+        menu = QMenu(self)
+        restore_action = menu.addAction(f"Restore '{backup.name}'...")
+        restore_action.triggered.connect(self._restore_selected_backup)
+        menu.addSeparator()
+        delete_action = menu.addAction(f"Delete '{backup.name}'...")
+        delete_action.triggered.connect(self._delete_selected_backup)
+        menu.exec(self.backups_table.viewport().mapToGlobal(pos))
+
     # -- server settings (serverconfig.xml) ------------------------------------------
 
     def _load_server_settings(self) -> None:
@@ -2474,6 +2869,30 @@ class MainWindow(QMainWindow):
         return new_xml
 
     # -- power ---------------------------------------------------------------------
+
+    def _on_restart_clicked(self) -> None:
+        if not self._ptero:
+            self.statusBar().showMessage("Pterodactyl is not connected", 4000)
+            return
+        if self._restart_countdown_active:
+            self.statusBar().showMessage("A restart countdown is already in progress", 4000)
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Restart Server")
+        box.setText("Restart the server now, or warn players first with a countdown?")
+        now_btn = box.addButton("Restart Now", QMessageBox.ButtonRole.AcceptRole)
+        countdown_btn = box.addButton("Countdown", QMessageBox.ButtonRole.ActionRole)
+        box.setDefaultButton(countdown_btn)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is now_btn:
+            if QMessageBox.question(
+                self, "Confirm", "Are you sure you want to restart the server now?"
+            ) == QMessageBox.StandardButton.Yes:
+                self._send_power_action("restart")
+        elif clicked is countdown_btn:
+            self.statusBar().showMessage("Restart countdown started -- warning players...", 6000)
+            self._begin_restart_countdown(self.RESTART_WARNING_SECONDS)
 
     def _send_power_action(self, action: str) -> None:
         if not self._ptero:

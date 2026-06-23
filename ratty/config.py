@@ -58,6 +58,7 @@ DEFAULT_RESTART_WARNING_MESSAGE = "Server restarting in {minutes} minute(s) -- b
 @dataclass
 class ServerConfig:
     name: str = "My Server"
+    is_default: bool = False
 
     telnet_host: str = ""
     telnet_port: int = DEFAULT_TELNET_PORT
