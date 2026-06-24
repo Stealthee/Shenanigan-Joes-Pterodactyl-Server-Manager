@@ -320,39 +320,6 @@ class InventoryDialog(QDialog):
         layout.addWidget(close_button)
 
 
-class RestartCountdownDialog(QDialog):
-    """Non-modal "restart pending" banner with a cancel button.
-
-    Closing it any way (Cancel button or the window's own close button) aborts
-    the pending restart -- the close path is the cancel path.
-    """
-
-    cancelled = Signal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Restart Pending")
-        self.setModal(False)
-        self._cancel_emitted = False
-
-        layout = QVBoxLayout(self)
-        self.label = QLabel("")
-        self.label.setStyleSheet("font-weight: bold;")
-        layout.addWidget(self.label)
-        cancel_btn = QPushButton("Cancel Restart")
-        cancel_btn.clicked.connect(self.close)
-        layout.addWidget(cancel_btn)
-
-    def set_text(self, text: str) -> None:
-        self.label.setText(text)
-
-    def closeEvent(self, event) -> None:
-        if not self._cancel_emitted:
-            self._cancel_emitted = True
-            self.cancelled.emit()
-        super().closeEvent(event)
-
-
 class MainWindow(QMainWindow):
     def __init__(self, config: ServerConfig, save_config_callback=None):
         super().__init__()
@@ -430,7 +397,7 @@ class MainWindow(QMainWindow):
         self._next_autorestart_at: float | None = None
         self._restart_countdown_active = False
         self._restart_countdown_timer: QTimer | None = None
-        self._restart_countdown_dialog: RestartCountdownDialog | None = None
+        self._restart_button: QPushButton | None = None
         self._restart_seconds_remaining = 0
         self._restart_warned_one_minute = False
 
@@ -519,6 +486,7 @@ class MainWindow(QMainWindow):
             btn = QPushButton(label)
             if action == "restart":
                 btn.clicked.connect(self._on_restart_clicked)
+                self._restart_button = btn
             else:
                 btn.clicked.connect(lambda _checked=False, a=action: self._send_power_action(a))
             if not has_ptero:
@@ -1014,10 +982,7 @@ class MainWindow(QMainWindow):
         minutes = max(round(seconds_until / 60), 1)
         self._broadcast_message(self._format_broadcast(self.config.autorestart_warning_message, minutes=minutes))
 
-        self._restart_countdown_dialog = RestartCountdownDialog(self)
-        self._restart_countdown_dialog.cancelled.connect(self._cancel_restart_countdown)
-        self._update_restart_countdown_dialog()
-        self._restart_countdown_dialog.show()
+        self._update_restart_button_text()
 
         timer = QTimer(self)
         timer.timeout.connect(self._tick_restart_countdown)
@@ -1027,7 +992,7 @@ class MainWindow(QMainWindow):
     def _tick_restart_countdown(self) -> None:
         self._restart_seconds_remaining -= 1
         remaining = self._restart_seconds_remaining
-        self._update_restart_countdown_dialog()
+        self._update_restart_button_text()
 
         if remaining <= 0:
             self._finish_restart_countdown()
@@ -1037,11 +1002,14 @@ class MainWindow(QMainWindow):
         elif remaining <= self.RESTART_FINAL_COUNTDOWN_SECONDS:
             self._broadcast_message(str(remaining))
 
-    def _update_restart_countdown_dialog(self) -> None:
-        if self._restart_countdown_dialog is None:
+    def _update_restart_button_text(self) -> None:
+        if self._restart_button is None:
             return
-        minutes, seconds = divmod(max(self._restart_seconds_remaining, 0), 60)
-        self._restart_countdown_dialog.set_text(f"Restarting in {minutes}:{seconds:02d}...")
+        if self._restart_countdown_active:
+            minutes, seconds = divmod(max(self._restart_seconds_remaining, 0), 60)
+            self._restart_button.setText(f"Cancel Restart ({minutes}:{seconds:02d})")
+        else:
+            self._restart_button.setText("Restart")
 
     def _stop_restart_countdown_timer(self) -> None:
         if self._restart_countdown_timer is not None:
@@ -1053,19 +1021,15 @@ class MainWindow(QMainWindow):
             return
         self._restart_countdown_active = False
         self._stop_restart_countdown_timer()
-        self._restart_countdown_dialog = None
+        self._update_restart_button_text()
         self._next_autorestart_at = None
         self.statusBar().showMessage("Restart cancelled", 5000)
         self._broadcast_message("Restart cancelled -- carry on!")
 
     def _finish_restart_countdown(self) -> None:
         self._stop_restart_countdown_timer()
-        if self._restart_countdown_dialog is not None:
-            dialog = self._restart_countdown_dialog
-            self._restart_countdown_dialog = None
-            dialog.cancelled.disconnect(self._cancel_restart_countdown)
-            dialog.close()
         self._restart_countdown_active = False
+        self._update_restart_button_text()
         self._next_autorestart_at = None
         self.statusBar().showMessage("Restart triggered", 6000)
         self._broadcast_message("Restarting now -- back shortly!")
@@ -2871,18 +2835,20 @@ class MainWindow(QMainWindow):
     # -- power ---------------------------------------------------------------------
 
     def _on_restart_clicked(self) -> None:
+        if self._restart_countdown_active:
+            self._cancel_restart_countdown()
+            return
         if not self._ptero:
             self.statusBar().showMessage("Pterodactyl is not connected", 4000)
-            return
-        if self._restart_countdown_active:
-            self.statusBar().showMessage("A restart countdown is already in progress", 4000)
             return
         box = QMessageBox(self)
         box.setWindowTitle("Restart Server")
         box.setText("Restart the server now, or warn players first with a countdown?")
         now_btn = box.addButton("Restart Now", QMessageBox.ButtonRole.AcceptRole)
         countdown_btn = box.addButton("Countdown", QMessageBox.ButtonRole.ActionRole)
+        cancel_btn = box.addButton(QMessageBox.StandardButton.Cancel)
         box.setDefaultButton(countdown_btn)
+        box.setEscapeButton(cancel_btn)
         box.exec()
         clicked = box.clickedButton()
         if clicked is now_btn:
