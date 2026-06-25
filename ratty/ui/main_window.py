@@ -83,6 +83,11 @@ _STARTUP_OVERRIDES: frozenset[str] = frozenset({
 #   Chat (from 'Steam_765xxxxx', entity id '171', to 'Global'): 'PlayerName': hello
 _CHAT_LINE_RE = re.compile(r"Chat \([^)]*\):\s*(?P<text>.*)$")
 
+# The server echoes every telnet command to its console -- including our own
+# background listplayers/gettime polling every refresh tick. Hide that noise
+# from the Console tab; the watchdog still sees it via _last_console_line_at.
+_NOISY_TELNET_POLL_RE = re.compile(r"Executing command '(?:listplayers|gettime)' by Telnet")
+
 
 def _land_claim_owner_matches(owner_id: str, steamid: str) -> bool:
     """Claim owner ids come back as e.g. 'Steam_7656119...' or 'EOS_<hex>' --
@@ -366,6 +371,7 @@ class MainWindow(QMainWindow):
         self._sftp_loading = False
 
         self._mods_entries: list[str] = []
+        self._maps_entries: list[str] = []
 
         self._backups: list[BackupEntry] = []
         self._backups_poll_timer: QTimer | None = None
@@ -553,6 +559,8 @@ class MainWindow(QMainWindow):
         tabs.addTab(self._build_settings_panel(), "Server Settings")
         self._mods_panel = self._build_mods_panel()
         tabs.addTab(self._mods_panel, "Mods")
+        self._maps_panel = self._build_maps_panel()
+        tabs.addTab(self._maps_panel, "Maps")
         self._backups_panel = self._build_backups_panel()
         tabs.addTab(self._backups_panel, "Backups")
         tabs.addTab(self._build_autorestart_panel(), "Auto Restart")
@@ -794,6 +802,38 @@ class MainWindow(QMainWindow):
         btn_row = QHBoxLayout()
         add_btn = QPushButton("Add Mod Folder...")
         add_btn.clicked.connect(self._mods_add)
+        btn_row.addWidget(add_btn)
+        btn_row.addStretch(1)
+        layout.addLayout(btn_row)
+
+        return wrapper
+
+    def _build_maps_panel(self) -> QWidget:
+        wrapper = QWidget()
+        layout = QVBoxLayout(wrapper)
+
+        if not self.config.sftp_host:
+            note = QLabel("Managing maps requires SFTP (not configured for this server).")
+            note.setWordWrap(True)
+            note.setStyleSheet("color: palette(placeholder-text);")
+            layout.addWidget(note)
+
+        top_row = QHBoxLayout()
+        top_row.addWidget(QLabel(f"Folder: <tt>{self.config.maps_dir}</tt>"))
+        top_row.addStretch(1)
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self._maps_refresh)
+        top_row.addWidget(refresh_btn)
+        layout.addLayout(top_row)
+
+        self.maps_list = QListWidget()
+        self.maps_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.maps_list.customContextMenuRequested.connect(self._show_maps_menu)
+        layout.addWidget(self.maps_list, 1)
+
+        btn_row = QHBoxLayout()
+        add_btn = QPushButton("Upload Map Folder...")
+        add_btn.clicked.connect(self._maps_add)
         btn_row.addWidget(add_btn)
         btn_row.addStretch(1)
         layout.addLayout(btn_row)
@@ -1437,7 +1477,7 @@ class MainWindow(QMainWindow):
             match = _CHAT_LINE_RE.search(line)
             if match:
                 self.chat_view.appendPlainText(match["text"])
-            else:
+            elif not _NOISY_TELNET_POLL_RE.search(line):
                 self.console_view.appendPlainText(line)
         elif tag == "ptero_status":
             self._ptero_status = str(value)
@@ -1453,6 +1493,7 @@ class MainWindow(QMainWindow):
             self._sftp_browse("/")
             self._load_server_settings()
             self._mods_refresh()
+            self._maps_refresh()
         elif tag == "sftp_reconnect":
             self._sftp = value  # type: ignore[assignment]
             self._set_sftp_status(True)
@@ -1460,6 +1501,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("SFTP reconnected", 5000)
             self._sftp_browse(self._sftp_cwd)
             self._mods_refresh()
+            self._maps_refresh()
         elif tag == "sftp_list":
             path, entries = value  # type: ignore[misc]
             self._sftp_cwd = path
@@ -1540,6 +1582,18 @@ class MainWindow(QMainWindow):
         elif tag == "mods_delete":
             self.statusBar().showMessage(f"Removed mod '{value}'", 5000)
             self._mods_refresh()
+        elif tag == "maps_list":
+            self._maps_entries = value  # type: ignore[assignment]
+            self._populate_maps_list()
+        elif tag == "maps_upload":
+            map_name, count = value  # type: ignore[misc]
+            self.statusBar().showMessage(
+                f"Uploaded map '{map_name}' ({count} file(s), permissions set to 755)", 6000
+            )
+            self._maps_refresh()
+        elif tag == "maps_delete":
+            self.statusBar().showMessage(f"Removed map '{value}'", 5000)
+            self._maps_refresh()
         elif tag == "backups_list":
             self._backups = value  # type: ignore[assignment]
             self._populate_backups_table()
@@ -1589,6 +1643,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Upload failed", f"Could not install mod:\n{message}")
         elif tag == "mods_delete":
             QMessageBox.warning(self, "Remove failed", f"Could not remove mod:\n{message}")
+        elif tag == "maps_list":
+            self.statusBar().showMessage(f"Maps folder not found or inaccessible: {message}", 8000)
+        elif tag == "maps_upload":
+            QMessageBox.warning(self, "Upload failed", f"Could not upload map:\n{message}")
+        elif tag == "maps_delete":
+            QMessageBox.warning(self, "Remove failed", f"Could not remove map:\n{message}")
         elif tag == "backup_create":
             QMessageBox.warning(self, "Backup failed", f"Could not start backup:\n{message}")
         elif tag == "backup_restore":
@@ -2583,6 +2643,72 @@ class MainWindow(QMainWindow):
     def _do_mods_delete(self, mod_name: str):
         self._sftp.delete_dir(self._sftp_join(self.config.mods_dir, mod_name))
         return mod_name
+
+    # -- maps -----------------------------------------------------------------------
+
+    def _maps_refresh(self) -> None:
+        if not self._sftp:
+            return
+        self._run_async("maps_list", self._do_maps_list)
+
+    def _populate_maps_list(self) -> None:
+        self.maps_list.clear()
+        for name in sorted(self._maps_entries, key=str.lower):
+            item = QListWidgetItem(name)
+            item.setData(Qt.ItemDataRole.UserRole, name)
+            item.setToolTip("Right-click to remove")
+            self.maps_list.addItem(item)
+        idx = self._left_tabs.indexOf(self._maps_panel)
+        self._left_tabs.setTabText(idx, f"Maps ({len(self._maps_entries)})")
+
+    def _maps_add(self) -> None:
+        if not self._sftp:
+            self.statusBar().showMessage("SFTP is not connected", 4000)
+            return
+        local_dir = QFileDialog.getExistingDirectory(
+            self, "Select map folder to upload", "",
+            options=QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontUseNativeDialog,
+        )
+        if not local_dir:
+            return
+        map_name = os.path.basename(local_dir.rstrip("/\\"))
+        remote_dir = self._sftp_join(self.config.maps_dir, map_name)
+        self.statusBar().showMessage(f"Uploading map '{map_name}'...", 4000)
+        self._run_async("maps_upload", lambda: self._do_maps_upload(local_dir, remote_dir, map_name))
+
+    def _show_maps_menu(self, pos) -> None:
+        item = self.maps_list.itemAt(pos)
+        if item is None:
+            return
+        map_name: str = item.data(Qt.ItemDataRole.UserRole)
+        menu = QMenu(self)
+        remove_action = menu.addAction(f"Remove '{map_name}'...")
+        remove_action.triggered.connect(lambda: self._maps_remove(map_name))
+        menu.exec(self.maps_list.viewport().mapToGlobal(pos))
+
+    def _maps_remove(self, map_name: str) -> None:
+        if not self._sftp:
+            return
+        if QMessageBox.question(
+            self,
+            "Remove map",
+            f"Permanently delete map '{map_name}' from the server?\n\nThis cannot be undone.",
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        self._run_async("maps_delete", lambda: self._do_maps_delete(map_name))
+
+    def _do_maps_list(self):
+        entries = self._sftp.list_dir(self.config.maps_dir)
+        return [e.name for e in entries if e.is_dir and not e.name.startswith(".")]
+
+    def _do_maps_upload(self, local_dir: str, remote_dir: str, map_name: str):
+        count = self._sftp.upload_dir(local_dir, remote_dir)
+        self._sftp.chmod_recursive(remote_dir, 0o755)
+        return map_name, count
+
+    def _do_maps_delete(self, map_name: str):
+        self._sftp.delete_dir(self._sftp_join(self.config.maps_dir, map_name))
+        return map_name
 
     # -- backups --------------------------------------------------------------------
 

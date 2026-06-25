@@ -88,6 +88,8 @@ class ServerConfig:
     mods_dir: str = "/Mods"
     locked_mods: list[str] = field(default_factory=list)
 
+    maps_dir: str = "/Data/Worlds"
+
     autorestart_enabled: bool = False
     autorestart_mode: str = "time"  # "time" (daily HH:MM) or "interval" (every N hours)
     autorestart_time: str = "04:00"
