@@ -195,6 +195,30 @@ class _Bridge(QObject):
     error = Signal(str, str)
 
 
+class _FocusSpinBox(QSpinBox):
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class _FocusDoubleSpinBox(QDoubleSpinBox):
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class _FocusComboBox(QComboBox):
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
 class TeleportToCoordsDialog(QDialog):
     def __init__(self, player_name: str, parent=None):
         super().__init__(parent)
@@ -2906,19 +2930,19 @@ class MainWindow(QMainWindow):
 
     def _make_settings_widget(self, prop: XmlProperty) -> QWidget:
         if prop.kind == "bool":
-            widget = QComboBox()
+            widget = _FocusComboBox()
             widget.addItems(["true", "false"])
             widget.setCurrentText(prop.value.lower())
             widget.currentTextChanged.connect(self._mark_settings_dirty)
             return widget
         if prop.kind == "int":
-            widget = QSpinBox()
+            widget = _FocusSpinBox()
             widget.setRange(-2_000_000_000, 2_000_000_000)
             widget.setValue(int(prop.value))
             widget.valueChanged.connect(self._mark_settings_dirty)
             return widget
         if prop.kind == "float":
-            widget = QDoubleSpinBox()
+            widget = _FocusDoubleSpinBox()
             widget.setRange(-1_000_000_000.0, 1_000_000_000.0)
             decimals = len(prop.value.split(".", 1)[1]) if "." in prop.value else 1
             widget.setDecimals(max(decimals, 1))
