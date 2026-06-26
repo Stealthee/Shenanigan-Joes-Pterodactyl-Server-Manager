@@ -756,6 +756,12 @@ class MainWindow(QMainWindow):
         top_row.addWidget(reload_btn)
         layout.addLayout(top_row)
 
+        self.settings_search = QLineEdit()
+        self.settings_search.setPlaceholderText("Search settings...")
+        self.settings_search.setClearButtonEnabled(True)
+        self.settings_search.textChanged.connect(self._filter_settings_form)
+        layout.addWidget(self.settings_search)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         self.settings_form_widget = QWidget()
@@ -2889,7 +2895,14 @@ class MainWindow(QMainWindow):
                     self.settings_form.addRow(prop.name, widget)
         finally:
             self._settings_loading = False
+        self._filter_settings_form(self.settings_search.text())
         self._set_settings_dirty(False)
+
+    def _filter_settings_form(self, text: str) -> None:
+        query = text.strip().lower()
+        for row, prop in enumerate(self._settings_properties):
+            visible = not query or query in prop.name.lower()
+            self.settings_form.setRowVisible(row, visible)
 
     def _make_settings_widget(self, prop: XmlProperty) -> QWidget:
         if prop.kind == "bool":
