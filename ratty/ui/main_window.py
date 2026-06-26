@@ -196,6 +196,10 @@ class _Bridge(QObject):
 
 
 class _FocusSpinBox(QSpinBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
     def wheelEvent(self, event):
         if self.hasFocus():
             super().wheelEvent(event)
@@ -204,6 +208,10 @@ class _FocusSpinBox(QSpinBox):
 
 
 class _FocusDoubleSpinBox(QDoubleSpinBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
     def wheelEvent(self, event):
         if self.hasFocus():
             super().wheelEvent(event)
@@ -212,6 +220,10 @@ class _FocusDoubleSpinBox(QDoubleSpinBox):
 
 
 class _FocusComboBox(QComboBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
     def wheelEvent(self, event):
         if self.hasFocus():
             super().wheelEvent(event)
